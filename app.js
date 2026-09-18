@@ -55,6 +55,107 @@
     return candidate && ID_RE.test(candidate) ? candidate : null;
   }
 
+  /* ---------- backup: export / import ---------- */
+
+  function exportLibrary() {
+    const payload = {
+      app: 'tempo',
+      schema: 1,
+      exportedAt: new Date().toISOString(),
+      library: state.library,
+      favorites: state.favorites,
+      queue: state.queue,
+      history: state.history
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `tempo-backup-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    flash(`Exported ${state.library.length} track${state.library.length === 1 ? '' : 's'}.`);
+  }
+
+  const str = (v, max = 300) => (typeof v === 'string' ? v : '').slice(0, max);
+
+  // Rebuilds each track field by field from primitives only. Nothing from the file is
+  // ever executed, spread wholesale into state, or trusted for its type; unknown keys
+  // are dropped and anything that isn't a valid video id is discarded.
+  function sanitizeImport(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Not a Tempo backup file.');
+    if (raw.app !== 'tempo') throw new Error('Not a Tempo backup file.');
+    if (!Array.isArray(raw.library)) throw new Error('Backup is missing its library.');
+
+    const library = [];
+    const seen = new Set();
+    for (const t of raw.library.slice(0, 2000)) {
+      if (!t || typeof t !== 'object') continue;
+      const id = str(t.id, 11);
+      if (!ID_RE.test(id) || seen.has(id)) continue;
+      seen.add(id);
+      library.push({
+        id,
+        title: str(t.title) || ('YouTube • ' + id),
+        artist: str(t.artist, 150),
+        source: 'YouTube',
+        thumb: thumbUrl(id),
+        url: watchUrl(id),
+        addedAt: Number.isFinite(t.addedAt) ? t.addedAt : Date.now(),
+        meta: ['ok', 'manual', 'failed', 'pending'].includes(t.meta) ? t.meta : undefined,
+        blocked: t.blocked === true || undefined
+      });
+    }
+    const ids = new Set(library.map(t => t.id));
+    const idList = v => (Array.isArray(v) ? v : [])
+      .filter(x => typeof x === 'string' && ids.has(x))
+      .filter((x, i, a) => a.indexOf(x) === i)
+      .slice(0, 500);
+
+    return {
+      library,
+      favorites: idList(raw.favorites),
+      queue: idList(raw.queue),
+      history: idList(raw.history).slice(0, 50)
+    };
+  }
+
+  function importLibrary(file) {
+    const reader = new FileReader();
+    reader.onerror = () => flash('Could not read that file.', true);
+    reader.onload = () => {
+      let clean;
+      try {
+        clean = sanitizeImport(JSON.parse(String(reader.result)));
+      } catch (err) {
+        flash(err instanceof SyntaxError ? 'That file is not valid JSON.' : err.message, true);
+        return;
+      }
+      if (!clean.library.length) { flash('That backup contains no valid tracks.', true); return; }
+      state = clean;
+      now = null;
+      playbackError = null;
+      destroyPlayer();
+      save(); render();
+      flash(`Imported ${clean.library.length} track${clean.library.length === 1 ? '' : 's'}.`);
+      backfillMeta();
+    };
+    reader.readAsText(file);
+  }
+
+  let flashTimer = null;
+  function flash(msg, isError = false) {
+    const el = document.querySelector('#backup-status');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'backup-status' + (isError ? ' is-error' : ' is-ok');
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => { const e = document.querySelector('#backup-status'); if (e) { e.textContent = ''; e.className = 'backup-status'; } }, 6000);
+  }
+
   function getTrack(id) { return state.library.find(t => t.id === id); }
   function byIds(ids) { return ids.map(getTrack).filter(Boolean); }
   function isFav(id) { return state.favorites.includes(id); }
@@ -291,10 +392,51 @@
       <p class="fineprint">Tempo looks up the title, artist and artwork from YouTube automatically. Only fill in a custom title if you want to override it.</p>
     </section>`;
 
-    if (tab === 'library') return section('Library','&#9635;',state.library,{delete:true,empty:'Your library is empty. Add a YouTube link first.'});
+    if (tab === 'library') return section('Library','&#9635;',state.library,{delete:true,empty:'Your library is empty. Add a YouTube link first.'}) + backupCard();
     if (tab === 'favorites') return section('Favorites','&hearts;',byIds(state.favorites),{empty:'No favorites yet.'});
     if (tab === 'queue') return section('Up next','&#9783;',byIds(state.queue),{unqueue:true,empty:'Queue is empty. Songs you queue play automatically when the current one ends.'});
     return '';
+  }
+
+  function backupCard() {
+    return `<section class="card backup-card">
+      <div class="eyebrow">BACKUP</div>
+      <p class="backup-copy">Your library lives in this browser only. Export a copy before switching devices or clearing Safari data.</p>
+      <div class="backup-actions">
+        <button data-action="export">&#8681; Export library</button>
+        <button data-action="import">&#8679; Import backup</button>
+      </div>
+      <input type="file" id="import-file" accept="application/json,.json" hidden>
+      <div id="backup-status" class="backup-status"></div>
+    </section>`;
+  }
+
+  /* ---------- iOS "Add to Home Screen" hint ---------- */
+
+  const HINT_KEY = 'tempo-install-hint-dismissed';
+
+  function isStandalone() {
+    return window.navigator.standalone === true ||
+      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  }
+
+  // Only real iOS Safari can Add to Home Screen — Chrome/Firefox/Edge on iOS cannot.
+  function shouldShowInstallHint() {
+    const ua = navigator.userAgent;
+    const isIOS = /iPad|iPhone|iPod/.test(ua) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const isRealSafari = !/CriOS|FxiOS|EdgiOS|OPiOS|Chrome/.test(ua);
+    let dismissed = false;
+    try { dismissed = localStorage.getItem(HINT_KEY) === '1'; } catch {}
+    return isIOS && isRealSafari && !isStandalone() && !dismissed;
+  }
+
+  function installHint() {
+    if (!shouldShowInstallHint()) return '';
+    return `<div class="install-hint">
+      <span><strong>Install Tempo:</strong> tap Share &#8679; then <strong>Add to Home Screen</strong></span>
+      <button data-action="dismiss-hint" aria-label="Dismiss">&times;</button>
+    </div>`;
   }
 
   // Shown instead of YouTube's own error screen when the owner blocks embedding.
@@ -385,6 +527,7 @@
   function render() {
     document.querySelector('#app').innerHTML = `<div class="app-shell">
       <header class="topbar"><div><div class="eyebrow">YOUR MUSIC</div><h1>Tempo</h1></div><div class="pill">V0.2</div></header>
+      ${installHint()}
       <main class="content">${body()}</main>
       <nav class="bottom-nav">
         ${nav('home','&#8962;','Home')}${nav('add','&#8981;','Add')}${nav('library','&#9635;','Library')}${nav('favorites','&hearts;','Liked')}${nav('queue','&#9783;','Queue')}
@@ -411,7 +554,20 @@
       case 'delete': removeTrack(id); break;
       case 'add': addTrack(); break;
       case 'close': now = null; playbackError = null; renderPlayer(); break;
+      case 'export': exportLibrary(); break;
+      case 'import': document.querySelector('#import-file')?.click(); break;
+      case 'dismiss-hint':
+        try { localStorage.setItem(HINT_KEY, '1'); } catch {}
+        render();
+        break;
     }
+  });
+
+  document.addEventListener('change', e => {
+    if (e.target.id !== 'import-file') return;
+    const file = e.target.files && e.target.files[0];
+    if (file) importLibrary(file);
+    e.target.value = '';
   });
 
   document.addEventListener('keydown', e => {

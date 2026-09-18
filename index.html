@@ -5,22 +5,39 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b0b0f" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Tempo" />
+  <meta name="description" content="Tempo - your personal music player, powered by YouTube's official player." />
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
   <link rel="icon" href="./icons/icon-192.png" />
-  <link rel="stylesheet" href="./styles.css?v=0.2.2" />
+  <!-- Bump ?v= here AND VERSION in sw.js together when app.js/styles.css change. -->
+  <link rel="stylesheet" href="./styles.css?v=0.3.1" />
   <title>Tempo</title>
 </head>
 <body>
   <div id="app"></div>
   <div id="player-root"></div>
-  <!-- Bump ?v= when app.js/styles.css change so phones don't serve a stale cache. -->
-  <script src="./app.js?v=0.2.2"></script>
+  <script src="./app.js?v=0.3.1"></script>
   <script>
     if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-      addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+      // Was this page already controlled? If so, a later controllerchange means a NEW
+      // version took over, and we reload once so the fresh JS/CSS is actually running.
+      var hadController = !!navigator.serviceWorker.controller;
+      var reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (!hadController || reloading) return;
+        reloading = true;
+        location.reload();
+      });
+      addEventListener('load', function () {
+        navigator.serviceWorker.register('./sw.js').then(function (reg) {
+          reg.update();
+          // Catch a new version that appears while the app is left open for a long time.
+          setInterval(function () { reg.update(); }, 60 * 60 * 1000);
+        }).catch(function () {});
+      });
     }
   </script>
 </body>

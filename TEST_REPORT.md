@@ -1,8 +1,198 @@
 # Tempo — Test Report
 
-**Last updated:** 2026-09-18 (V0.2 — Phases A/B/C)
+**Last updated:** 2026-09-18 (V0.3 — deployment readiness)
 **Project path:** `C:\Users\ELaptop800\Projects\music-player`
-**Asset version:** `0.2.2`
+**Asset version:** `0.3.1`
+
+> ### V0.3 results are in the section below; the V0.2 report follows underneath.
+
+---
+
+# V0.3 — Deployment readiness (2026-09-18)
+
+**Goal:** get Tempo onto a permanent public HTTPS URL that works from an iPhone with the
+laptop switched off, and harden it for a real field test.
+
+**Result: deployment-ready and fully built, but NOT yet live — GitHub login is the only
+thing missing, and it requires you.** Everything else is done, tested, and committed.
+
+## Deployment status
+
+`gh` (GitHub CLI 2.98.0) is installed but **not authenticated**, and there are no stored
+credentials for any provider:
+
+| Provider | CLI | Auth | Verdict |
+|---|---|---|---|
+| GitHub Pages | ✅ `gh` 2.98.0 installed | ❌ not logged in | **Chosen** — one login away |
+| Cloudflare Pages | ❌ needs npm | ❌ | Node.js not installed |
+| Netlify | ❌ needs npm | ❌ | Node.js not installed |
+| Vercel | ❌ needs npm | ❌ | Node.js not installed |
+
+Also checked and empty: `GITHUB_TOKEN`, `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`,
+`NETLIFY_AUTH_TOKEN`, `VERCEL_TOKEN`, `~/.config/gh/hosts.yml`, `~/.netlify`,
+`~/.wrangler`, `~/.vercel`, Windows Credential Manager, and global git identity.
+
+No account was created and nothing paid was signed up for. `gh auth login` is interactive
+(browser/device approval) and cannot be automated, so this is a genuine hard blocker —
+the case you anticipated.
+
+**Mitigation:** `DEPLOY.ps1` / `DEPLOY.bat` now performs the login *and* the entire
+deploy in one command. Its PowerShell parses cleanly, and every `gh` subcommand and flag
+it uses was verified present on this machine.
+
+## Public-origin audit (Phase 3)
+
+Repository scanned for `localhost`, `127.0.0.1`, `192.168.`, `5173`:
+
+| Finding | Verdict |
+|---|---|
+| `index.html:24` — `location.hostname === 'localhost'` in the SW guard | ✅ Correct. It's `https: OR localhost`, so the SW registers on the public site **and** local dev. |
+| `README.md`, `CLAUDE_HANDOFF.md`, `START_TEMPO.bat` | ✅ Local-dev docs only, never executed by the deployed app |
+| **Runtime code depending on localhost / LAN IP** | ✅ **None** |
+
+| Check | Result |
+|---|---|
+| Absolute paths (`/app.js` etc.) that would break on a Pages subpath | ✅ none — every reference is relative (`./…`) |
+| Mixed content (`http://`) | ✅ none — only `https://` outbound |
+| `manifest` `start_url` / `scope` | ✅ `./` — subpath-safe |
+
+The app is subpath-safe, so `https://<user>.github.io/tempo/` will work without changes.
+
+## Phase 4 — PWA / iPhone install
+
+| Check | Result |
+|---|---|
+| `manifest.name` | ✅ `Tempo` (was "Tempo Music") |
+| `display` | ✅ `standalone` |
+| `theme_color` / `background_color` | ✅ `#0b0b0f` both |
+| Icons 192 + 512 decode at declared size | ✅ verified |
+| `apple-touch-icon` | ✅ 180×180 |
+| `id`, `scope`, `orientation` added | ✅ |
+| Home-indicator clearance on bottom nav | ✅ `env(safe-area-inset-bottom)` |
+| **Player sheet home-indicator clearance** | ✅ **added** — was missing, sheet is `inset:0` |
+| Notch / status-bar clearance on top bar | ✅ `env(safe-area-inset-top)` |
+| `100dvh` sizing | ✅ present |
+
+### iOS install hint — 10/10 assertions passed
+
+Small dismissible bar: *"Install Tempo: tap Share ⇧ then Add to Home Screen"*.
+
+| Condition | Behaviour |
+|---|---|
+| Desktop Chrome | ✅ hidden |
+| iOS Safari | ✅ shown |
+| iOS Chrome (`CriOS`) | ✅ hidden — it genuinely cannot Add to Home Screen |
+| Already installed (standalone) | ✅ hidden |
+| Dismissed with × | ✅ hidden, persisted to `localStorage`, stays gone across renders |
+
+Tested by spoofing `navigator.userAgent` / `navigator.standalone` and re-rendering.
+
+## Phase 5 — Service worker hardening (the stale-JS fix)
+
+The stale-`app.js` problem from the last session is **fixed and proven**, not just
+patched.
+
+Test: planted two stale caches (`tempo-shell-v0.2.2`, `tempo-shell-v1`) containing fake
+old JS, bumped `VERSION` 0.3.0 → 0.3.1, and called `registration.update()`.
+
+| Assertion | Result |
+|---|---|
+| Page auto-reloaded onto the new version | ✅ now running `app.js?v=0.3.1` |
+| New cache created | ✅ `tempo-shell-0.3.1` |
+| **All** stale caches purged | ✅ only `tempo-shell-0.3.1` remained |
+| No SW stuck in `waiting` | ✅ `skipWaiting()` worked |
+| New SW controlling the page | ✅ |
+| New `app.js` precached | ✅ |
+| Old `app.js` gone from cache | ✅ |
+| App still functional after auto-update | ✅ |
+
+The reload is deliberately gated on `hadController`, so a **first** visit never
+reload-loops — only a genuine version takeover triggers it.
+
+Also fixed a real SW bug: the old fetch handler could answer **any** failed request with
+`index.html`, so a failed thumbnail would have received HTML. It now only handles
+same-origin GETs, and only navigations may fall back to the shell.
+
+## Phase 6 — Export / Import
+
+**Export** — verified by intercepting the generated Blob:
+filename `tempo-backup-2026-09-18.json`, `application/json`, containing
+`app`, `schema`, `exportedAt`, `library`, `favorites`, `queue`, `history`.
+
+**Import** — driven through the real `<input type="file">` with real `File` objects.
+
+Round-trip and rejection, 13/13 passed:
+
+| Case | Result |
+|---|---|
+| Valid backup restores library/favorites/queue/history | ✅ |
+| Persists to `localStorage` and re-renders | ✅ |
+| Invalid JSON | ✅ rejected, "That file is not valid JSON." |
+| Foreign file (`app:'spotify'`) | ✅ rejected |
+| Missing library / empty library / array payload | ✅ rejected |
+| **Existing library survived every rejection** | ✅ |
+
+### Hostile-input hardening — 20/20 passed
+
+Fed a deliberately malicious backup (XSS payloads, prototype pollution, path traversal,
+`javascript:` URLs, wrong types, 5000-char strings, duplicates, nulls):
+
+| Attack | Result |
+|---|---|
+| `<img src=x onerror=…>` / `<script>` in title & artist | ✅ **no execution** — stored inert, rendered as escaped text |
+| `__proto__` pollution in payload and track | ✅ **no pollution** — `({}).polluted` undefined |
+| `javascript:` in `thumb` / `url` | ✅ **discarded** — both rebuilt from the video ID |
+| `../../etc/passwd` as id | ✅ dropped |
+| Non-11-char ids, duplicates, nulls, numbers | ✅ dropped / deduped |
+| Wrong types (number title, object artist, string `addedAt`) | ✅ coerced safely |
+| Unknown fields | ✅ dropped |
+| Over-long strings | ✅ capped at 300 chars |
+| Ghost ids in favorites/queue/history | ✅ filtered against the real library |
+
+Nothing from the file is executed, spread into state, or trusted for its type — every
+track is rebuilt field by field from primitives only.
+
+## Phase 8 — Automated testing
+
+**Against the public URL: not possible — the site isn't deployed yet.** Those tests are
+written into `FIELD_TEST.md` and must run after `DEPLOY.bat`.
+
+Everything was instead verified against the local server at a true 390px viewport.
+**21/21 passed, zero uncaught errors:**
+
+| Check | Result |
+|---|---|
+| Metadata auto-fills on add | ✅ LuisFonsiVEVO, officialpsy, Rick Astley |
+| No horizontal overflow — home/add/library/favorites/queue | ✅ 390/390 each |
+| Backup card renders, buttons inside viewport | ✅ right edge 353px |
+| Favorites / queue / history / delete | ✅ |
+| `YT.Player` mounts with real duration | ✅ 214s |
+| No overflow with player open | ✅ |
+| Queue auto-advance + player reused | ✅ |
+| Restricted-video fallback + *Open in YouTube* | ✅ |
+| No overflow in blocked state | ✅ |
+| Thumbnails decode | ✅ 480×360 |
+| Manifest name/display/scope/start_url | ✅ Tempo / standalone / `./` / `./` |
+
+## Still unverified (needs the iPhone)
+
+1. **Actual audio playback** — unchanged from V0.2. Chrome suspends media in the
+   backgrounded automation tab (`visibilityState: "hidden"` throughout), so playback is
+   verified only up to "player loaded, duration known, controllable".
+2. **Auto-advance on iOS** — iOS requires a user gesture before playback; it may pause at
+   the track boundary. Most likely iPhone-specific difference.
+3. **Background audio** — expected to stop on lock/app-switch (YouTube + iOS policy, not
+   worked around). Record real behaviour.
+4. **Export download on iOS** — `<a download>` support is inconsistent in iOS Safari.
+5. **Standalone-mode layout on a real device** — safe-area CSS is correct but unverified
+   on hardware.
+6. **Offline shell** — the SW precaches the shell, but true offline behaviour was not
+   exercised under real network loss.
+
+---
+
+# V0.2 — Phases A/B/C (2026-09-18)
+
 
 | Phase | Status |
 |---|---|
