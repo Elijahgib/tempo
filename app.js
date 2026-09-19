@@ -12,10 +12,14 @@
 
   const APP_NAME = 'Tempo';
   const AUDIUS = 'https://api.audius.co/v1';
+  const JAMENDO = 'https://api.jamendo.com/v3.0';
   const KEY_V2 = 'tempo-state-v2';
   const KEY_V1 = 'tempo-state-v1';
   const HINT_KEY = 'tempo-install-hint-dismissed';
   const YT_NOTICE_KEY = 'tempo-yt-notice-seen';
+  // Kept in localStorage, never in the repo — this is a public GitHub Pages site.
+  const JAMENDO_KEY = 'tempo-jamendo-client-id';
+  const DEBUG_KEY = 'tempo-search-debug';
   const ID_RE = /^[A-Za-z0-9_-]{11}$/;
   const YT_HOSTS = ['youtube.com','www.youtube.com','m.youtube.com','music.youtube.com','youtu.be','www.youtu.be','youtube-nocookie.com','www.youtube-nocookie.com'];
   const FATAL_YT = [2, 5, 100, 101, 150];
@@ -25,7 +29,7 @@
   let state = load();
   let tab = 'favorites';
   let view = null;             // { kind:'playlist', id } etc.
-  let search = { q: '', mode: 'tracks', results: [], artists: [], loading: false, error: '', ran: false };
+  let search = { q: '', mode: 'tracks', results: [], artists: [], loading: false, error: '', ran: false, notes: [], raw: null };
   let now = null;              // uid of the loaded track
   let nowPlaying = false;      // full-screen Now Playing open?
   let shuffle = false;
@@ -77,7 +81,12 @@
     for (const [uid, t] of Object.entries(s.tracks)) {
       if (!t || typeof t !== 'object') { delete s.tracks[uid]; continue; }
       t.uid = uid;
-      t.provider = ['audius','local','youtube'].includes(t.provider) ? t.provider : 'youtube';
+      // The uid prefix is authoritative: it repairs rows written by a build whose
+      // provider allow-list was missing a provider (which rewrote them to youtube).
+      const fromUid = uid.slice(0, uid.indexOf(':'));
+      const known = ['audius','jamendo','local','youtube'];
+      t.provider = known.includes(fromUid) ? fromUid
+        : (known.includes(t.provider) ? t.provider : 'youtube');
       t.artist = t.artist || '';
       t.duration = Number.isFinite(t.duration) ? t.duration : 0;
     }
@@ -140,6 +149,51 @@
       streamUrl(t) { return `${AUDIUS}/tracks/${encodeURIComponent(t.providerTrackId)}/stream?app_name=${APP_NAME}`; }
     },
 
+    jamendo: {
+      id: 'jamendo', label: 'Jamendo', background: true,
+      get clientId() { try { return localStorage.getItem(JAMENDO_KEY) || ''; } catch { return ''; } },
+      get enabled() { return !!this.clientId; },
+      async _query(q) {
+        const u = `${JAMENDO}/tracks/?client_id=${encodeURIComponent(this.clientId)}&format=json&limit=40`
+          + `&include=stats&imagesize=300&search=${encodeURIComponent(q)}`;
+        const r = await fetch(u);
+        if (!r.ok) throw new Error('Jamendo HTTP ' + r.status);
+        const j = await r.json();
+        const h = j.headers || {};
+        if (h.status !== 'success') throw new Error('Jamendo: ' + (h.error_message || 'request failed'));
+        return (j.results || []).filter(playableJamendo).map(fromJamendo);
+      },
+      // Jamendo intermittently answers "success" with an empty result set for
+      // queries that do have matches, so an empty reply gets one retry.
+      async search(q) {
+        if (!this.enabled) return [];
+        let out = await this._query(q);
+        if (!out.length) {
+          await new Promise(r => setTimeout(r, 450));
+          out = await this._query(q);
+        }
+        return out;
+      },
+      // The audio URL carries an opaque "from" token, so it is resolved on demand
+      // and cached for the session only — never written to storage or backups.
+      streamUrl(t) { return streamRefs.get(t.uid) || ''; },
+      async resolveStream(t) {
+        const cached = streamRefs.get(t.uid);
+        if (cached) return cached;
+        if (!this.enabled) throw new Error('Jamendo is not set up.');
+        const u = `${JAMENDO}/tracks/?client_id=${encodeURIComponent(this.clientId)}&format=json&id=${encodeURIComponent(t.providerTrackId)}`;
+        // Same intermittent-empty behaviour as search, so retry once.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt) await new Promise(r => setTimeout(r, 450));
+          const r = await fetch(u);
+          if (!r.ok) continue;
+          const hit = ((await r.json()).results || [])[0];
+          if (hit && hit.audio) { streamRefs.set(t.uid, hit.audio); return hit.audio; }
+        }
+        throw new Error('Jamendo stream unavailable.');
+      }
+    },
+
     local: {
       id: 'local', label: 'My Music', background: true,
       streamUrl(t) { return localUrls.get(t.uid) || ''; }
@@ -173,11 +227,125 @@
       artwork: art['480x480'] || art['150x150'] || art['1000x1000'] || '',
       duration: Number(t.duration) || 0,
       url: t.permalink ? 'https://audius.co' + t.permalink : 'https://audius.co',
-      addedAt: Date.now()
+      addedAt: Date.now(),
+      playCount: Number(t.play_count) || 0,
+      favoriteCount: Number(t.favorite_count) || 0,
+      repostCount: Number(t.repost_count) || 0
     };
   }
 
-  const localUrls = new Map(); // uid -> object URL (session only)
+  function playableJamendo(t) { return t && t.audio && t.name && t.id; }
+
+  function fromJamendo(t) {
+    const s = t.stats || {};
+    const tr = {
+      uid: 'jamendo:' + t.id,
+      provider: 'jamendo',
+      providerTrackId: String(t.id),
+      title: String(t.name || 'Untitled').slice(0, 300),
+      artist: String(t.artist_name || '').slice(0, 150),
+      artwork: t.image || t.album_image || '',
+      duration: Number(t.duration) || 0,
+      url: t.shareurl || 'https://www.jamendo.com',
+      addedAt: Date.now(),
+      playCount: Number(s.rate_listened_total) || 0,
+      favoriteCount: Number(s.favorited) || 0,
+      repostCount: Number(s.playlisted) || 0
+    };
+    if (t.audio) streamRefs.set(tr.uid, t.audio);
+    return tr;
+  }
+
+  const localUrls = new Map();  // uid -> object URL (session only)
+  const streamRefs = new Map(); // uid -> resolved stream URL (session only)
+
+  /* ---------- search ranking ----------
+     One scorer for every provider. Engagement is converted to a percentile
+     *within each provider's own result set*, so a provider with bigger raw
+     numbers cannot dominate purely because of scale.                        */
+
+  function norm(s) {
+    return String(s || '').toLowerCase().normalize('NFKD')
+      .replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9 ]+/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  function textScore(t, q) {
+    const query = norm(q);
+    if (!query) return { score: 0, why: 'no query' };
+    const title = norm(t.title), artist = norm(t.artist);
+    const toks = query.split(' ').filter(Boolean);
+    const combo = title + ' ' + artist;
+
+    if (title === query) return { score: 100, why: 'exact title', exact: true };
+    if (artist === query) return { score: 92, why: 'exact artist', exact: true };
+    if (norm(t.artist + ' ' + t.title) === query || norm(t.title + ' ' + t.artist) === query)
+      return { score: 96, why: 'exact artist + title', exact: true };
+    if (title.startsWith(query)) return { score: 70, why: 'title prefix' };
+    if (artist.startsWith(query)) return { score: 56, why: 'artist prefix' };
+
+    const word = (hay, k) => new RegExp('\\b' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(hay);
+    const inTitle = toks.filter(k => word(title, k)).length;
+    const inArtist = toks.filter(k => word(artist, k)).length;
+    const inCombo = toks.filter(k => combo.includes(k)).length;
+
+    if (inTitle === toks.length) return { score: 48, why: 'all terms in title' };
+    if (inTitle + inArtist >= toks.length) return { score: 40, why: 'terms across title + artist' };
+    if (inCombo === toks.length) return { score: 30, why: 'all terms (loose)' };
+    return { score: Math.round(18 * inCombo / toks.length), why: inCombo + '/' + toks.length + ' terms matched' };
+  }
+
+  function engagementPercentiles(list) {
+    const raw = list.map(t =>
+      Math.log10(1 + (t.playCount || 0)) * 1.0 +
+      Math.log10(1 + (t.favoriteCount || 0)) * 1.4 +
+      Math.log10(1 + (t.repostCount || 0)) * 1.2);
+    const sorted = [...raw].sort((a, b) => a - b);
+    return raw.map(v => sorted.length > 1 ? sorted.filter(x => x < v).length / (sorted.length - 1) : 0.5);
+  }
+
+  // Almost no engagement AND not an exact match -> buried.
+  function isLowEngagement(t) {
+    return (t.playCount || 0) < 50 && (t.favoriteCount || 0) < 5 && (t.repostCount || 0) < 3;
+  }
+
+  function rankResults(groups, q) {
+    const scored = [];
+    for (const list of groups) {
+      if (!list.length) continue;
+      const pct = engagementPercentiles(list);
+      list.forEach((t, i) => {
+        const ts = textScore(t, q);
+        const engPts = pct[i] * 30;
+        const low = isLowEngagement(t);
+        const penalty = (low && !ts.exact) ? -30 : 0;
+        scored.push({
+          ...t,
+          _score: ts.score + engPts + penalty,
+          _dbg: {
+            text: ts.score, why: ts.why,
+            engPct: Math.round(pct[i] * 100), engPts: Math.round(engPts),
+            penalty, plays: t.playCount || 0, favs: t.favoriteCount || 0, reposts: t.repostCount || 0,
+            total: Math.round(ts.score + engPts + penalty)
+          }
+        });
+      });
+    }
+    // Deduplicate obvious title+artist repeats across providers, keeping the best score.
+    const seen = new Map();
+    for (const t of scored) {
+      const key = norm(t.title) + '|' + norm(t.artist);
+      const prev = seen.get(key);
+      if (!prev) { seen.set(key, t); continue; }
+      const win = t._score > prev._score ? t : prev;
+      const lose = win === t ? prev : t;
+      win._dbg.dupOf = (win._dbg.dupOf || []).concat(lose.provider);
+      seen.set(key, win);
+    }
+    return [...seen.values()].sort((a, b) => b._score - a._score);
+  }
+
+  function searchDebugOn() { try { return localStorage.getItem(DEBUG_KEY) === '1'; } catch { return false; } }
 
   function extractVideoId(input = '') {
     const v = String(input).trim();
@@ -201,14 +369,31 @@
 
   const audio = new Audio();
   audio.preload = 'metadata';
-  audio.crossOrigin = 'anonymous';
+  // No crossOrigin: an <audio> element only needs a plain media load, and
+  // Jamendo's CDN sends no CORS headers — setting it would break playback there.
 
   const engine = {
     load(t, autoplay = true) {
-      const src = providers[t.provider].streamUrl(t);
-      if (!src) { toast('That local file is no longer available this session.', true); return; }
-      if (audio.src !== src) { audio.src = src; audio.load(); }
-      if (autoplay) engine.play();
+      const p = providers[t.provider];
+      const src = p.streamUrl ? p.streamUrl(t) : '';
+      if (src) {
+        if (audio.src !== src) { audio.src = src; audio.load(); }
+        if (autoplay) engine.play();
+        return;
+      }
+      if (p.resolveStream) {
+        // Resolving costs a round trip, which can outlive the user gesture on
+        // iOS. If autoplay is then refused, the toast tells the user to tap play.
+        p.resolveStream(t).then(url => {
+          if (now !== t.uid) return;
+          audio.src = url; audio.load();
+          if (autoplay) engine.play();
+        }).catch(err => toast(err.message || 'Could not load that track.', true));
+        return;
+      }
+      toast(t.provider === 'local'
+        ? 'That local file is no longer available this session.'
+        : 'No playable stream for that track.', true);
     },
     play() {
       const p = audio.play();
@@ -414,8 +599,10 @@
      ========================================================================= */
 
   function addTrack(t) {
+    // _score/_dbg are per-search ranking artifacts — never persist them.
+    const { _score, _dbg, ...clean } = t;
     const existing = state.tracks[t.uid];
-    state.tracks[t.uid] = existing ? { ...existing, ...t, addedAt: existing.addedAt } : t;
+    state.tracks[t.uid] = existing ? { ...existing, ...clean, addedAt: existing.addedAt } : clean;
     save();
     return state.tracks[t.uid];
   }
@@ -479,6 +666,7 @@
   async function runSearch(q) {
     const mine = ++searchSeq;
     search.q = q; search.loading = true; search.error = ''; search.ran = true;
+    search.notes = []; search.raw = null;
     render();
     try {
       const yt = extractVideoId(q);
@@ -492,12 +680,17 @@
         }];
         search.artists = [];
       } else {
-        const [tracks, artists] = await Promise.all([
-          providers.audius.search(q),
+        // Both providers in parallel; one failing must not kill the other.
+        const [au, jam, artists] = await Promise.all([
+          providers.audius.search(q).catch(e => { search.notes.push('Audius: ' + e.message); return []; }),
+          providers.jamendo.search(q).catch(e => { search.notes.push('Jamendo: ' + e.message); return []; }),
           providers.audius.searchArtists(q).catch(() => [])
         ]);
         if (mine !== searchSeq) return;
-        search.results = tracks; search.artists = artists;
+        search.raw = { audius: au.length, jamendo: jam.length };
+        search.results = rankResults([au, jam], q);
+        search.artists = artists;
+        if (!au.length && !jam.length && !search.notes.length) search.notes.push('No results from either provider.');
       }
     } catch (e) {
       if (mine !== searchSeq) return;
@@ -556,7 +749,7 @@
       if (!t || typeof t !== 'object') continue;
       let provider, pid;
       if (modern) {
-        provider = ['audius','youtube'].includes(t.provider) ? t.provider : null;
+        provider = ['audius','jamendo','youtube'].includes(t.provider) ? t.provider : null;
         pid = s300(t.providerTrackId, 64);
       } else {
         provider = 'youtube'; pid = s300(t.id, 11);
@@ -564,6 +757,7 @@
       if (!provider || !pid) continue;
       if (provider === 'youtube' && !ID_RE.test(pid)) continue;
       if (provider === 'audius' && !/^[A-Za-z0-9_-]{1,32}$/.test(pid)) continue;
+      if (provider === 'jamendo' && !/^[0-9]{1,16}$/.test(pid)) continue;
       const uid = provider + ':' + pid;
       if (out.tracks[uid]) continue;
       const art = s300(t.artwork || t.thumb, 500);
@@ -573,7 +767,7 @@
         artist: s300(t.artist, 150),
         artwork: /^https:\/\//.test(art) ? art : (provider === 'youtube' ? ytThumb(pid) : ''),
         duration: Number.isFinite(t.duration) ? t.duration : 0,
-        url: provider === 'youtube' ? ytWatch(pid) : 'https://audius.co',
+        url: provider === 'youtube' ? ytWatch(pid) : (provider === 'jamendo' ? 'https://www.jamendo.com' : 'https://audius.co'),
         addedAt: Number.isFinite(t.addedAt) ? t.addedAt : Date.now(),
         meta: ['ok','manual','failed','pending'].includes(t.meta) ? t.meta : undefined,
         blocked: t.blocked === true || undefined
@@ -647,10 +841,33 @@
       : `<div class="art ${cls} art-ph">${esc((t.title || '?').slice(0, 1).toUpperCase())}</div>`;
   }
 
-  function badge(t) {
+  const PROV_TAG = {
+    audius: '<span class="tag tag-audius">AUDIUS</span>',
+    jamendo: '<span class="tag tag-jamendo">JAMENDO</span>',
+    youtube: '<span class="tag tag-yt">YT</span>',
+    local: '<span class="tag tag-local">FILE</span>'
+  };
+  function badge(t, showSource) {
+    if (showSource) return PROV_TAG[t.provider] || '';
     if (t.provider === 'youtube') return '<span class="tag tag-yt">YT</span>';
     if (t.provider === 'local') return '<span class="tag tag-local">FILE</span>';
     return '';
+  }
+
+  function plays(n) {
+    if (!n) return '';
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M plays';
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K plays';
+    return n + ' plays';
+  }
+
+  function debugLine(t) {
+    const d = t._dbg;
+    if (!d) return '';
+    return `<div class="dbg">#${d.total} = text ${d.text} (${esc(d.why)}) + eng ${d.engPts} (p${d.engPct})`
+      + `${d.penalty ? ' ' + d.penalty + ' low-engagement' : ''}`
+      + ` · ${d.plays}p/${d.favs}f/${d.reposts}r`
+      + `${d.dupOf ? ' · deduped ' + esc(d.dupOf.join(',')) : ''}</div>`;
   }
 
   function row(uid, opts = {}) {
@@ -661,7 +878,8 @@
       ${art(t)}
       <div class="row-txt">
         <div class="row-title">${esc(t.title)}</div>
-        <div class="row-sub">${badge(t)}${esc(t.artist || providers[t.provider].label)}${t.duration ? ' · ' + fmt(t.duration) : ''}</div>
+        <div class="row-sub">${badge(t, opts.showSource)}${esc(t.artist || providers[t.provider].label)}${t.duration ? ' · ' + fmt(t.duration) : ''}${opts.showSource && t.playCount ? ' · ' + plays(t.playCount) : ''}</div>
+        ${opts.debug ? debugLine(t) : ''}
       </div>
       <button class="row-btn" data-action="menu" data-uid="${esc(t.uid)}" aria-label="More">&#8942;</button>
     </div>`;
@@ -730,6 +948,7 @@
 
   function viewSearch() {
     const res = search.results;
+    const dbg = searchDebugOn();
     return `<div class="head"><h1>Search</h1></div>
       <div class="search-wrap">
         <input id="q" class="search-input" type="search" placeholder="Songs, artists, or a YouTube link"
@@ -741,9 +960,11 @@
       ${!search.loading && !search.error && search.ran && !res.length ? '<div class="empty sm">No results.</div>' : ''}
       ${search.artists.length ? `<div class="shelf"><div class="shelf-head"><h2>Artists</h2></div>
         <div class="hscroll">${search.artists.map(a => `<button class="card-sm round" data-action="artist" data-id="${esc(a.id)}">${a.artwork ? `<img class="art art-lg" src="${esc(a.artwork)}" alt="" loading="lazy">` : '<div class="art art-lg art-ph">' + esc(a.name.slice(0, 1)) + '</div>'}<span>${esc(a.name)}</span><em>${a.trackCount} tracks</em></button>`).join('')}</div></div>` : ''}
+      ${search.notes.length ? `<div class="notes">${search.notes.map(n => esc(n)).join('<br>')}</div>` : ''}
+      ${dbg && search.raw ? `<div class="dbg dbg-top">raw: audius ${search.raw.audius} · jamendo ${search.raw.jamendo} → ${res.length} after ranking + dedupe</div>` : ''}
       <div class="list">${res.map(t => {
         addTrackShadow(t);
-        return row(t.uid, { track: t, ctx: 'search' });
+        return row(t.uid, { track: t, ctx: 'search', showSource: true, debug: dbg });
       }).join('')}</div>`;
   }
 
@@ -770,9 +991,32 @@
         <input type="file" id="local-file" accept="audio/*" multiple hidden>
       </div>
       <div class="panel">
+        <h3>Jamendo</h3>
+        <p>A second free catalogue. Needs your own free client ID &mdash; it is stored only in this browser, never in the app's public source.</p>
+        <ol class="steps">
+          <li>Open <b>devportal.jamendo.com</b> and sign up (free)</li>
+          <li>Create an app, then copy its <b>Client ID</b></li>
+          <li>Paste it below</li>
+        </ol>
+        <input id="jamendo-id" class="settings-input" type="text" placeholder="Jamendo client ID"
+          value="${esc(providers.jamendo.clientId)}" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <div class="two">
+          <button data-action="save-jamendo">Save</button>
+          <button data-action="test-jamendo">Test</button>
+        </div>
+        <div id="jamendo-status" class="settings-status">${providers.jamendo.enabled ? 'Enabled.' : 'Not set up &mdash; searches use Audius only.'}</div>
+      </div>
+      <div class="panel">
+        <h3>Search debug</h3>
+        <p>Shows the ranking breakdown under every search result: text score, engagement percentile, penalties and dedupe.</p>
+        <button data-action="toggle-debug">${searchDebugOn() ? 'Turn OFF search debug' : 'Turn ON search debug'}</button>
+      </div>
+      <div class="panel">
         <h3>Providers</h3>
         <div class="prov"><b>Audius</b><span class="ok">Background playback</span></div>
         <p class="tiny">Free, open music streaming. No account required.</p>
+        <div class="prov"><b>Jamendo</b><span class="${providers.jamendo.enabled ? 'ok' : 'warn'}">${providers.jamendo.enabled ? 'Background playback' : 'Needs a client ID'}</span></div>
+        <p class="tiny">Creative Commons catalogue. Free client ID required.</p>
         <div class="prov"><b>My Music</b><span class="ok">Background playback</span></div>
         <p class="tiny">Your own audio files, this session only.</p>
         <div class="prov"><b>YouTube</b><span class="warn">Foreground only</span></div>
@@ -784,7 +1028,7 @@
       </div>
       <div class="panel">
         <h3>About</h3>
-        <p class="tiny">Tempo ${'0.4.0'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
+        <p class="tiny">Tempo ${'0.5.5'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
       </div>`;
   }
 
@@ -1022,6 +1266,21 @@
       case 'import': document.querySelector('#import-file')?.click(); break;
       case 'pick-local': document.querySelector('#local-file')?.click(); break;
       case 'dismiss-hint': try { localStorage.setItem(HINT_KEY, '1'); } catch {} render(); break;
+      case 'save-jamendo': {
+        const v = (document.querySelector('#jamendo-id')?.value || '').trim();
+        try { v ? localStorage.setItem(JAMENDO_KEY, v) : localStorage.removeItem(JAMENDO_KEY); } catch {}
+        render();
+        toast(v ? 'Jamendo enabled.' : 'Jamendo client ID cleared.');
+        break;
+      }
+      case 'test-jamendo': testJamendo(); break;
+      case 'toggle-debug': {
+        const on = searchDebugOn();
+        try { on ? localStorage.removeItem(DEBUG_KEY) : localStorage.setItem(DEBUG_KEY, '1'); } catch {}
+        render();
+        toast('Search debug ' + (on ? 'off' : 'on'));
+        break;
+      }
       case 'seek': {
         const t = current(); if (!t || isYT(t)) return;
         const bar = el.querySelector('.seek-bar') || el;
@@ -1101,6 +1360,20 @@
     sheet(`<div class="sheet-title">Add to playlist</div>
       ${state.playlists.map(p => `<button data-action="pick-pl" data-id="${esc(p.id)}" data-uid="${esc(uid)}">${esc(p.name)} <em>${p.trackUids.length}</em></button>`).join('')}
       <button data-action="close-sheet">Cancel</button>`);
+  }
+
+  async function testJamendo() {
+    const el = document.querySelector('#jamendo-status');
+    const v = (document.querySelector('#jamendo-id')?.value || '').trim();
+    if (!v) { if (el) el.textContent = 'Enter a client ID first.'; return; }
+    try { localStorage.setItem(JAMENDO_KEY, v); } catch {}
+    if (el) el.textContent = 'Testing…';
+    try {
+      const n = (await providers.jamendo.search('piano')).length;
+      if (el) el.textContent = n ? `Working — ${n} results for "piano".` : 'Connected, but no results came back.';
+    } catch (e) {
+      if (el) el.textContent = 'Failed: ' + e.message;
+    }
   }
 
   async function loadArtist(id) {
