@@ -658,7 +658,10 @@
 
   // Your own files: matched locally, instantly, and given a standing bonus so a
   // track you actually own outranks a streaming near-match of equal text score.
-  const LOCAL_BONUS = 25;
+  // Deliberately above the 30-point engagement ceiling: at equal text relevance
+  // a file you own always outranks a streaming result, while a genuinely better
+  // text match (exact vs prefix) still wins overall.
+  const LOCAL_BONUS = 35;
   function searchLocal(q) {
     const query = norm(q);
     if (!query) return [];
@@ -1402,7 +1405,7 @@
       </div>
       <div class="panel">
         <h3>About</h3>
-        <p class="tiny">Tempo ${'0.6.2'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
+        <p class="tiny">Tempo ${'0.6.3'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
       </div>`;
   }
 

@@ -8,7 +8,7 @@
  * deleted, clients.claim() takes over open pages, and the page reloads itself once
  * (see the controllerchange handler in index.html).
  */
-const VERSION = '0.6.2';
+const VERSION = '0.6.3';
 const CACHE = 'tempo-shell-' + VERSION;
 const SHELL = [
   './',
