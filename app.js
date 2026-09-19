@@ -1402,7 +1402,7 @@
       </div>
       <div class="panel">
         <h3>About</h3>
-        <p class="tiny">Tempo ${'0.6.1'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
+        <p class="tiny">Tempo ${'0.6.2'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
       </div>`;
   }
 
