@@ -195,8 +195,19 @@
     },
 
     local: {
-      id: 'local', label: 'My Music', background: true,
-      streamUrl(t) { return localUrls.get(t.uid) || ''; }
+      id: 'local', label: 'My Music', background: true, offline: true,
+      streamUrl(t) { return localUrls.get(t.uid) || ''; },
+      // Blobs live in IndexedDB; an object URL is minted only for playback and
+      // revoked as soon as another track takes over.
+      async resolveStream(t) {
+        const cached = localUrls.get(t.uid);
+        if (cached) return cached;
+        const blob = await idbGetBlob(t.providerTrackId);
+        if (!blob) throw new Error('That file is no longer in Tempo storage.');
+        const url = URL.createObjectURL(blob);
+        localUrls.set(t.uid, url);
+        return url;
+      }
     },
 
     youtube: {
@@ -259,6 +270,301 @@
   const localUrls = new Map();  // uid -> object URL (session only)
   const streamRefs = new Map(); // uid -> resolved stream URL (session only)
 
+  /* =========================================================================
+     IndexedDB — durable storage for imported audio files
+     Blobs are stored as-is. Bytes are never base64'd, never put in
+     localStorage, and never altered.
+     ========================================================================= */
+
+  const DB_NAME = 'tempo-media';
+  const DB_STORE = 'files';
+  const DB_VERSION = 1;
+  let dbPromise = null;
+
+  function idb() {
+    if (dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve, reject) => {
+      if (!window.indexedDB) return reject(new Error('IndexedDB unavailable'));
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, { keyPath: 'id' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+      req.onblocked = () => reject(new Error('IndexedDB blocked'));
+    }).catch(err => { dbPromise = null; throw err; });
+    return dbPromise;
+  }
+
+  function idbTx(mode, fn) {
+    return idb().then(db => new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, mode);
+      const store = tx.objectStore(DB_STORE);
+      let out;
+      try { out = fn(store); } catch (e) { reject(e); return; }
+      tx.oncomplete = () => resolve(out && out.result !== undefined ? out.result : out);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('transaction aborted'));
+    }));
+  }
+
+  const idbPut = rec => idbTx('readwrite', s => s.put(rec));
+  const idbDelete = id => idbTx('readwrite', s => s.delete(id));
+  const idbClear = () => idbTx('readwrite', s => s.clear());
+
+  function idbGetBlob(id) {
+    return idbTx('readonly', s => s.get(id)).then(r => (r && r.blob) || null).catch(() => null);
+  }
+
+  function idbKeys() {
+    return idbTx('readonly', s => s.getAllKeys()).catch(() => []);
+  }
+
+  function idbTotalBytes() {
+    return idbTx('readonly', s => s.getAll())
+      .then(all => (all || []).reduce((n, r) => n + (r.size || (r.blob && r.blob.size) || 0), 0))
+      .catch(() => 0);
+  }
+
+  function releaseLocalUrl(uid) {
+    const u = localUrls.get(uid);
+    if (u) { try { URL.revokeObjectURL(u); } catch {} localUrls.delete(uid); }
+  }
+
+  // Only one local object URL is held at a time: the one currently loaded.
+  function releaseOtherLocalUrls(keepUid) {
+    for (const uid of [...localUrls.keys()]) if (uid !== keepUid) releaseLocalUrl(uid);
+  }
+
+  /* ---------- import ---------- */
+
+  const AUDIO_EXT = /\.(mp3|m4a|aac|wav|flac|ogg|oga|opus|m4b|mp4|aif|aiff)$/i;
+
+  function canPlayFile(file) {
+    const probe = document.createElement('audio');
+    if (file.type && probe.canPlayType(file.type)) return true;
+    // iOS often reports an empty type for files picked from Files.app.
+    if (!file.type && AUDIO_EXT.test(file.name)) return true;
+    if (file.type && file.type.startsWith('audio/')) return true;
+    return false;
+  }
+
+  function bytes(n) {
+    if (!n) return '0 B';
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + ' GB';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+    if (n >= 1e3) return (n / 1e3).toFixed(0) + ' KB';
+    return n + ' B';
+  }
+
+  // "03 - Drake - Headlines.mp3" -> { artist:'Drake', title:'Headlines' }
+  // Conservative: only splits on a clear " - " separator.
+  function fromFileName(name) {
+    let base = String(name || '').replace(/\.[^.]+$/, '');
+    base = base.replace(/^\s*\d{1,3}\s*[-._)]\s+/, '');   // leading track number
+    base = base.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+    const parts = base.split(/\s+-\s+/);
+    if (parts.length === 2 && parts[0].length > 1 && parts[1].length > 1) {
+      return { artist: parts[0].trim(), title: parts[1].trim() };
+    }
+    return { artist: '', title: base || 'Untitled' };
+  }
+
+  // Minimal ID3v2 / MP4 tag reading — no dependency. Returns {} when unsure.
+  async function readTags(file) {
+    try {
+      const head = new Uint8Array(await file.slice(0, 256 * 1024).arrayBuffer());
+      if (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) return readId3v2(head);
+      return readMp4Tags(head);
+    } catch { return {}; }
+  }
+
+  function readId3v2(b) {
+    const major = b[3];
+    const size = ((b[6] & 0x7f) << 21) | ((b[7] & 0x7f) << 14) | ((b[8] & 0x7f) << 7) | (b[9] & 0x7f);
+    const end = Math.min(10 + size, b.length);
+    const out = {};
+    let p = 10;
+    const dec = (arr, enc) => {
+      try {
+        if (enc === 1 || enc === 2) return new TextDecoder('utf-16').decode(arr).replace(/\0+$/, '');
+        if (enc === 3) return new TextDecoder('utf-8').decode(arr).replace(/\0+$/, '');
+        return new TextDecoder('iso-8859-1').decode(arr).replace(/\0+$/, '');
+      } catch { return ''; }
+    };
+    while (p + 10 <= end) {
+      const id = String.fromCharCode(b[p], b[p + 1], b[p + 2], b[p + 3]);
+      if (!/^[A-Z0-9]{4}$/.test(id)) break;
+      let fs;
+      if (major === 4) fs = ((b[p + 4] & 0x7f) << 21) | ((b[p + 5] & 0x7f) << 14) | ((b[p + 6] & 0x7f) << 7) | (b[p + 7] & 0x7f);
+      else fs = (b[p + 4] << 24) | (b[p + 5] << 16) | (b[p + 6] << 8) | b[p + 7];
+      if (fs <= 0 || p + 10 + fs > end) break;
+      const body = b.subarray(p + 10, p + 10 + fs);
+      if (id === 'TIT2') out.title = dec(body.subarray(1), body[0]);
+      else if (id === 'TPE1') out.artist = dec(body.subarray(1), body[0]);
+      else if (id === 'TALB') out.album = dec(body.subarray(1), body[0]);
+      else if (id === 'APIC') {
+        try {
+          const enc = body[0];
+          let i = 1;
+          while (i < body.length && body[i] !== 0) i++;            // mime
+          const mime = dec(body.subarray(1, i), 0) || 'image/jpeg';
+          i++; i++;                                                 // picture type
+          if (enc === 1 || enc === 2) { while (i + 1 < body.length && !(body[i] === 0 && body[i + 1] === 0)) i += 2; i += 2; }
+          else { while (i < body.length && body[i] !== 0) i++; i++; }
+          if (i < body.length) out.picture = new Blob([body.subarray(i)], { type: mime });
+        } catch {}
+      }
+      p += 10 + fs;
+    }
+    for (const k of ['title', 'artist', 'album']) if (out[k]) out[k] = out[k].replace(/\0/g, '').trim();
+    return out;
+  }
+
+  // Walks MP4 atoms to moov>udta>meta>ilst for ©nam/©ART/©alb/covr.
+  function readMp4Tags(b) {
+    const out = {};
+    const u32 = o => (b[o] << 24 >>> 0) + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3];
+    const tag = o => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+    const CONTAINERS = ['moov', 'udta', 'meta', 'ilst'];
+    function walk(start, end, depth) {
+      let p = start;
+      while (p + 8 <= end && depth < 6) {
+        let size = u32(p);
+        const name = tag(p + 4);
+        if (size === 1) return;                 // 64-bit sizes: skip
+        if (size < 8 || p + size > end) return;
+        if (CONTAINERS.includes(name)) {
+          walk(p + 8 + (name === 'meta' ? 4 : 0), p + size, depth + 1);
+        } else if (['©nam', '©ART', '©alb', 'covr'].includes(name)) {
+          let q = p + 8;
+          while (q + 8 <= p + size) {
+            const dsz = u32(q);
+            if (tag(q + 4) === 'data' && dsz >= 16 && q + dsz <= p + size) {
+              const payload = b.subarray(q + 16, q + dsz);
+              if (name === 'covr') { try { out.picture = new Blob([payload], { type: 'image/jpeg' }); } catch {} }
+              else {
+                let v = '';
+                try { v = new TextDecoder('utf-8').decode(payload).replace(/\0/g, '').trim(); } catch {}
+                if (name === '©nam') out.title = v;
+                if (name === '©ART') out.artist = v;
+                if (name === '©alb') out.album = v;
+              }
+              break;
+            }
+            if (dsz < 8) break;
+            q += dsz;
+          }
+        }
+        p += size;
+      }
+    }
+    walk(0, b.length, 0);
+    return out;
+  }
+
+  function probeDuration(blob) {
+    return new Promise(resolve => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('audio');
+      const done = v => { try { URL.revokeObjectURL(url); } catch {} resolve(v); };
+      a.preload = 'metadata';
+      a.onloadedmetadata = () => done(Number.isFinite(a.duration) ? a.duration : 0);
+      a.onerror = () => done(0);
+      setTimeout(() => done(0), 6000);
+      a.src = url;
+    });
+  }
+
+  async function importLocalFiles(files) {
+    const accepted = [], rejected = [];
+    for (const f of files) (canPlayFile(f) ? accepted : rejected).push(f);
+    if (!accepted.length) {
+      toast(rejected.length ? 'Those files are not playable audio.' : 'No files selected.', true);
+      return { added: 0, rejected: rejected.length };
+    }
+
+    let added = 0, failed = 0;
+    for (const f of accepted) {
+      try {
+        const id = 'lf_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 9);
+        const tags = await readTags(f);
+        const guess = fromFileName(f.name);
+        let artwork = '';
+        if (tags.picture) { try { artwork = await blobToDataUrl(tags.picture); } catch {} }
+        const duration = await probeDuration(f);
+
+        await idbPut({ id, blob: f, name: f.name, type: f.type || '', size: f.size, addedAt: Date.now() });
+
+        addTrack({
+          uid: 'local:' + id,
+          provider: 'local',
+          providerTrackId: id,
+          title: (tags.title || guess.title || f.name).slice(0, 300),
+          artist: (tags.artist || guess.artist || '').slice(0, 150),
+          album: (tags.album || '').slice(0, 150),
+          artwork,
+          duration: duration || 0,
+          url: '',
+          fileName: f.name,
+          mimeType: f.type || '',
+          fileSize: f.size,
+          addedAt: Date.now()
+        });
+        added++;
+      } catch (e) { failed++; }
+    }
+
+    render();
+    const bits = [];
+    if (added) bits.push(added + ' track' + (added === 1 ? '' : 's') + ' imported');
+    if (rejected.length) bits.push(rejected.length + ' skipped (not audio)');
+    if (failed) bits.push(failed + ' failed');
+    toast(bits.join(' · ') || 'Nothing imported.', !added);
+    return { added, rejected: rejected.length, failed };
+  }
+
+  // Cover art is small and must survive reload, so it is inlined as a data URL
+  // in the metadata record. Audio bytes are never treated this way.
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      if (blob.size > 900 * 1024) return resolve('');
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ''));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(blob);
+    });
+  }
+
+  async function deleteLocalTrack(uid) {
+    const t = track(uid);
+    if (!t || t.provider !== 'local') return;
+    releaseLocalUrl(uid);
+    try { await idbDelete(t.providerTrackId); } catch {}
+    removeTrack(uid);
+  }
+
+  async function clearLocalLibrary() {
+    const locals = Object.values(state.tracks).filter(t => t.provider === 'local');
+    for (const t of locals) releaseLocalUrl(t.uid);
+    try { await idbClear(); } catch {}
+    for (const t of locals) removeTrack(t.uid);
+    render();
+    toast('Local music cleared.');
+  }
+
+  // Metadata and blobs can drift apart if one write fails; reconcile on boot.
+  async function reconcileLocalLibrary() {
+    let keys;
+    try { keys = await idbKeys(); } catch { return; }
+    const have = new Set(keys || []);
+    const orphanedMeta = Object.values(state.tracks)
+      .filter(t => t.provider === 'local' && !have.has(t.providerTrackId));
+    orphanedMeta.forEach(t => { t.missing = true; });
+    if (orphanedMeta.length) { save(); render(); }
+  }
+
   /* ---------- search ranking ----------
      One scorer for every provider. Engagement is converted to a percentile
      *within each provider's own result set*, so a provider with bigger raw
@@ -316,17 +622,20 @@
       const pct = engagementPercentiles(list);
       list.forEach((t, i) => {
         const ts = textScore(t, q);
-        const engPts = pct[i] * 30;
-        const low = isLowEngagement(t);
-        const penalty = (low && !ts.exact) ? -30 : 0;
+        const isLocal = t.provider === 'local';
+        // Local files carry no engagement signal, so they get an ownership
+        // bonus instead — never the low-engagement penalty.
+        const engPts = isLocal ? 0 : pct[i] * 30;
+        const ownPts = isLocal ? LOCAL_BONUS : 0;
+        const penalty = (!isLocal && isLowEngagement(t) && !ts.exact) ? -30 : 0;
         scored.push({
           ...t,
-          _score: ts.score + engPts + penalty,
+          _score: ts.score + engPts + ownPts + penalty,
           _dbg: {
             text: ts.score, why: ts.why,
-            engPct: Math.round(pct[i] * 100), engPts: Math.round(engPts),
+            engPct: Math.round(pct[i] * 100), engPts: Math.round(engPts), own: ownPts,
             penalty, plays: t.playCount || 0, favs: t.favoriteCount || 0, reposts: t.repostCount || 0,
-            total: Math.round(ts.score + engPts + penalty)
+            total: Math.round(ts.score + engPts + ownPts + penalty)
           }
         });
       });
@@ -346,6 +655,18 @@
   }
 
   function searchDebugOn() { try { return localStorage.getItem(DEBUG_KEY) === '1'; } catch { return false; } }
+
+  // Your own files: matched locally, instantly, and given a standing bonus so a
+  // track you actually own outranks a streaming near-match of equal text score.
+  const LOCAL_BONUS = 25;
+  function searchLocal(q) {
+    const query = norm(q);
+    if (!query) return [];
+    return localTracks().filter(t => {
+      const hay = norm(t.title) + ' ' + norm(t.artist) + ' ' + norm(t.album || '') + ' ' + norm(t.fileName || '');
+      return query.split(' ').filter(Boolean).every(k => hay.includes(k));
+    });
+  }
 
   function extractVideoId(input = '') {
     const v = String(input).trim();
@@ -385,12 +706,15 @@
         // Resolving costs a round trip, which can outlive the user gesture on
         // iOS. If autoplay is then refused, the toast tells the user to tap play.
         p.resolveStream(t).then(url => {
-          if (now !== t.uid) return;
+          // The user may have moved on while this resolved — drop the stale URL
+          // rather than leaving it minted.
+          if (now !== t.uid) { if (t.provider === 'local') releaseLocalUrl(t.uid); return; }
           audio.src = url; audio.load();
           if (autoplay) engine.play();
         }).catch(err => toast(err.message || 'Could not load that track.', true));
         return;
       }
+      if (t.provider === 'local') { toast('That file is no longer in Tempo storage.', true); return; }
       toast(t.provider === 'local'
         ? 'That local file is no longer available this session.'
         : 'No playable stream for that track.', true);
@@ -502,6 +826,9 @@
     state.queue = state.queue.filter(x => x !== uid);
     save();
 
+    // Any non-local track means no local blob is needed any more.
+    if (t.provider !== 'local') releaseOtherLocalUrls(null);
+
     if (isYT(t)) {
       engine.pause();
       if (!localStorage.getItem(YT_NOTICE_KEY)) {
@@ -512,6 +839,7 @@
       render();
     } else {
       ytDestroy();
+      if (t.provider === 'local') releaseOtherLocalUrls(t.uid);
       engine.load(t, true);
       if (opts.open !== false) nowPlaying = true;
       render();
@@ -565,7 +893,7 @@
       navigator.mediaSession.metadata = new window.MediaMetadata({
         title: t.title || 'Tempo',
         artist: t.artist || '',
-        album: 'Tempo',
+        album: t.album || 'Tempo',
         artwork: t.artwork ? [
           { src: t.artwork, sizes: '512x512', type: 'image/jpeg' },
           { src: t.artwork, sizes: '192x192', type: 'image/jpeg' }
@@ -680,6 +1008,9 @@
         }];
         search.artists = [];
       } else {
+        // Your own library is searched instantly and ranked alongside the
+        // streaming providers — never gated on network timing.
+        const local = searchLocal(q);
         // Both providers in parallel; one failing must not kill the other.
         const [au, jam, artists] = await Promise.all([
           providers.audius.search(q).catch(e => { search.notes.push('Audius: ' + e.message); return []; }),
@@ -687,10 +1018,12 @@
           providers.audius.searchArtists(q).catch(() => [])
         ]);
         if (mine !== searchSeq) return;
-        search.raw = { audius: au.length, jamendo: jam.length };
-        search.results = rankResults([au, jam], q);
+        search.raw = { local: local.length, audius: au.length, jamendo: jam.length };
+        search.results = rankResults([local, au, jam], q);
         search.artists = artists;
-        if (!au.length && !jam.length && !search.notes.length) search.notes.push('No results from either provider.');
+        if (!local.length && !au.length && !jam.length && !search.notes.length) {
+          search.notes.push('No results.');
+        }
       }
     } catch (e) {
       if (mine !== searchSeq) return;
@@ -716,10 +1049,16 @@
      Backup
      ========================================================================= */
 
+  // METADATA ONLY. Audio bytes are never placed in this file — local tracks are
+  // exported as references to blobs that must still exist in Tempo's IndexedDB.
   function exportLibrary() {
     const payload = {
-      app: 'tempo', schema: 2, exportedAt: new Date().toISOString(),
-      tracks: Object.values(state.tracks).filter(t => t.provider !== 'local'),
+      app: 'tempo', schema: 3, exportedAt: new Date().toISOString(),
+      kind: 'metadata-backup',
+      note: 'Metadata only. This file does NOT contain your audio files. Imported music lives in Tempo\'s local storage on each device; keep your original files backed up separately.',
+      tracks: Object.values(state.tracks).map(t => t.provider === 'local'
+        ? { ...t, audioIncluded: false, requiresLocalFile: true }
+        : t),
       favorites: state.favorites, queue: state.queue, history: state.history,
       playlists: state.playlists
     };
@@ -729,7 +1068,9 @@
     a.href = url; a.download = 'tempo-backup-' + new Date().toISOString().slice(0, 10) + '.json';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast('Exported ' + payload.tracks.length + ' tracks.');
+    const nLocal = payload.tracks.filter(t => t.provider === 'local').length;
+    toast('Exported metadata for ' + payload.tracks.length + ' tracks'
+      + (nLocal ? ' (' + nLocal + ' local — audio files not included)' : '') + '.');
   }
 
   const s300 = (v, m = 300) => (typeof v === 'string' ? v : '').slice(0, m);
@@ -749,7 +1090,7 @@
       if (!t || typeof t !== 'object') continue;
       let provider, pid;
       if (modern) {
-        provider = ['audius','jamendo','youtube'].includes(t.provider) ? t.provider : null;
+        provider = ['audius','jamendo','youtube','local'].includes(t.provider) ? t.provider : null;
         pid = s300(t.providerTrackId, 64);
       } else {
         provider = 'youtube'; pid = s300(t.id, 11);
@@ -758,6 +1099,7 @@
       if (provider === 'youtube' && !ID_RE.test(pid)) continue;
       if (provider === 'audius' && !/^[A-Za-z0-9_-]{1,32}$/.test(pid)) continue;
       if (provider === 'jamendo' && !/^[0-9]{1,16}$/.test(pid)) continue;
+      if (provider === 'local' && !/^lf_[A-Za-z0-9_]{1,40}$/.test(pid)) continue;
       const uid = provider + ':' + pid;
       if (out.tracks[uid]) continue;
       const art = s300(t.artwork || t.thumb, 500);
@@ -806,21 +1148,8 @@
     reader.readAsText(file);
   }
 
-  function addLocalFiles(files) {
-    let n = 0;
-    for (const f of files) {
-      if (!f.type.startsWith('audio/')) continue;
-      const uid = 'local:' + f.name.replace(/[^A-Za-z0-9_.-]/g, '_') + ':' + f.size;
-      localUrls.set(uid, URL.createObjectURL(f));
-      addTrack({
-        uid, provider: 'local', providerTrackId: f.name,
-        title: f.name.replace(/\.[^.]+$/, '').slice(0, 300),
-        artist: 'My Music', artwork: '', duration: 0, url: '', addedAt: Date.now()
-      });
-      n++;
-    }
-    render();
-    toast(n ? n + ' file' + (n === 1 ? '' : 's') + ' added for this session.' : 'No audio files found.', !n);
+  function localTracks() {
+    return Object.values(state.tracks).filter(t => t.provider === 'local');
   }
 
   function toast(msg, isErr = false) {
@@ -845,12 +1174,19 @@
     audius: '<span class="tag tag-audius">AUDIUS</span>',
     jamendo: '<span class="tag tag-jamendo">JAMENDO</span>',
     youtube: '<span class="tag tag-yt">YT</span>',
-    local: '<span class="tag tag-local">FILE</span>'
+    local: '<span class="tag tag-local">MY MUSIC</span>'
   };
+
+  let online = navigator.onLine !== false;
+  addEventListener('online', () => { online = true; render(); });
+  addEventListener('offline', () => { online = false; render(); });
+
+  // Offline: local files still play, streaming does not.
+  function unavailableOffline(t) { return !online && t.provider !== 'local'; }
   function badge(t, showSource) {
     if (showSource) return PROV_TAG[t.provider] || '';
     if (t.provider === 'youtube') return '<span class="tag tag-yt">YT</span>';
-    if (t.provider === 'local') return '<span class="tag tag-local">FILE</span>';
+    if (t.provider === 'local') return '<span class="tag tag-local">MY MUSIC</span>';
     return '';
   }
 
@@ -874,10 +1210,11 @@
     const t = track(uid) || opts.track;
     if (!t) return '';
     const on = now === t.uid;
-    return `<div class="row${on ? ' row-on' : ''}" data-action="${opts.rowAction || 'play'}" data-uid="${esc(t.uid)}" data-ctx="${esc(opts.ctx || '')}">
+    const off = unavailableOffline(t);
+    return `<div class="row${on ? ' row-on' : ''}${off ? ' row-off' : ''}" data-action="${opts.rowAction || 'play'}" data-uid="${esc(t.uid)}" data-ctx="${esc(opts.ctx || '')}">
       ${art(t)}
       <div class="row-txt">
-        <div class="row-title">${esc(t.title)}</div>
+        <div class="row-title">${esc(t.title)}${t.missing ? ' <span class="tag tag-miss">MISSING</span>' : ''}${off ? ' <span class="tag tag-miss">NEEDS INTERNET</span>' : ''}</div>
         <div class="row-sub">${badge(t, opts.showSource)}${esc(t.artist || providers[t.provider].label)}${t.duration ? ' · ' + fmt(t.duration) : ''}${opts.showSource && t.playCount ? ' · ' + plays(t.playCount) : ''}</div>
         ${opts.debug ? debugLine(t) : ''}
       </div>
@@ -911,6 +1248,19 @@
   }
 
   function viewPlaylists() {
+    if (view && view.kind === 'mymusic') {
+      const list = localTracks().sort((a, b) => b.addedAt - a.addedAt);
+      return `<div class="head">
+          <button class="back" data-action="back">&#8592;</button>
+          <h1>My Music</h1>
+          <div class="head-sub">${list.length} imported &middot; available offline</div>
+        </div>
+        ${list.length ? `<button class="shuffle-btn" data-action="shuffle-local">&#128256; Shuffle Play</button>` : ''}
+        <div class="list">${list.length
+          ? list.map(u => row(u.uid, { ctx: 'mymusic' })).join('')
+          : '<div class="empty">No imported music yet.<br><span>More &rarr; Import music</span></div>'}</div>`;
+    }
+
     if (view && view.kind === 'playlist') {
       const p = state.playlists.find(x => x.id === view.id);
       if (!p) { view = null; return viewPlaylists(); }
@@ -920,15 +1270,33 @@
           <div class="head-sub">${p.trackUids.length} ${p.trackUids.length === 1 ? 'song' : 'songs'}</div>
         </div>
         ${p.trackUids.length ? `<button class="shuffle-btn" data-action="shuffle-playlist" data-id="${esc(p.id)}">&#128256; Shuffle Play</button>` : ''}
-        <div class="list">${p.trackUids.length ? p.trackUids.map(u => row(u, { ctx: 'playlist:' + p.id })).join('') : '<div class="empty">Empty playlist.<br><span>Use the ⋮ menu on any song to add it here.</span></div>'}</div>
-        <button class="danger-btn" data-action="delete-playlist" data-id="${esc(p.id)}">Delete playlist</button>`;
+        <div class="list">${p.trackUids.length ? p.trackUids.map((u, i) => {
+          const inner = row(u, { ctx: 'playlist:' + p.id });
+          if (!inner) return '';
+          return inner.replace('</div>\n    </div>', '</div>\n    </div>') + `<div class="pl-ctl">
+            <button data-action="pl-up" data-id="${esc(p.id)}" data-i="${i}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">&#9650;</button>
+            <button data-action="pl-down" data-id="${esc(p.id)}" data-i="${i}" ${i === p.trackUids.length - 1 ? 'disabled' : ''} aria-label="Move down">&#9660;</button>
+            <button data-action="pl-remove" data-id="${esc(p.id)}" data-uid="${esc(u)}" aria-label="Remove">&times;</button>
+          </div>`;
+        }).join('') : '<div class="empty">Empty playlist.<br><span>Use the ⋮ menu on any song to add it here.</span></div>'}</div>
+        <div class="two" style="margin-top:20px">
+          <button class="mini-btn" data-action="rename-playlist" data-id="${esc(p.id)}">Rename</button>
+          <button class="danger-btn" style="margin:0" data-action="delete-playlist" data-id="${esc(p.id)}">Delete</button>
+        </div>`;
     }
 
+    const recent = state.history.map(track).filter(Boolean).slice(0, 12);
     const recentAdded = Object.values(state.tracks).sort((a, b) => b.addedAt - a.addedAt).slice(0, 12);
     const recentPlayed = state.history.map(track).filter(Boolean).slice(0, 12);
     const mosaic = list => `<div class="mosaic">${list.slice(0, 4).map(t => t.artwork ? `<img src="${esc(t.artwork)}" alt="" loading="lazy">` : '<div class="m-ph"></div>').join('') || '<div class="m-ph"></div>'}</div>`;
 
+    const myMusic = localTracks();
     return `<div class="head"><h1>Playlists</h1></div>
+      ${myMusic.length ? `<button class="mymusic-btn" data-action="open-mymusic">&#9835; My Music<em>${myMusic.length} imported &middot; plays offline</em></button>` : ''}
+      ${recent.length ? `<div class="shelf">
+        <div class="shelf-head"><h2>Recent</h2><span>${recent.length}</span></div>
+        <div class="hscroll">${recent.slice(0, 8).map(t => `<button class="card-sm" data-action="play" data-uid="${esc(t.uid)}" data-ctx="history">${art(t, 'art-lg')}<span>${esc(t.title)}</span><em>${esc(t.artist)}</em></button>`).join('')}</div>
+      </div>` : ''}
       <div class="shelf">
         <div class="shelf-head"><h2>Recently Added</h2><span>${recentAdded.length}</span></div>
         ${recentAdded.length ? `<div class="hscroll">${recentAdded.map(t => `<button class="card-sm" data-action="play" data-uid="${esc(t.uid)}" data-ctx="recent-added">${art(t, 'art-lg')}<span>${esc(t.title)}</span><em>${esc(t.artist)}</em></button>`).join('')}</div>` : '<div class="empty sm">Nothing yet.</div>'}
@@ -986,9 +1354,15 @@
       </div>
       <div class="panel">
         <h3>My Music</h3>
-        <p>Add audio files from this device. They play with full background support, but are available for this session only — Tempo does not copy your files.</p>
-        <button data-action="pick-local">+ Add audio files</button>
-        <input type="file" id="local-file" accept="audio/*" multiple hidden>
+        <p>Import audio you own. Files are stored inside Tempo, stay across restarts, play offline, and work with background playback.</p>
+        <button data-action="pick-local">&#43; Import music</button>
+        <input type="file" id="local-file" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.opus" multiple hidden>
+        <div class="storage-line" id="storage-line">${localTracks().length} imported</div>
+        ${localTracks().length ? `<div class="two" style="margin-top:9px">
+          <button data-action="manage-local">Manage files</button>
+          <button class="danger-inline" data-action="clear-local">Clear all</button>
+        </div>` : ''}
+        <p class="tiny warn-note">iOS can evict browser storage if the device runs very low on space. Tempo cannot prevent that — keep your originals in Files or iCloud.</p>
       </div>
       <div class="panel">
         <h3>Jamendo</h3>
@@ -1028,7 +1402,7 @@
       </div>
       <div class="panel">
         <h3>About</h3>
-        <p class="tiny">Tempo ${'0.5.5'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
+        <p class="tiny">Tempo ${'0.6.1'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
       </div>`;
   }
 
@@ -1236,6 +1610,31 @@
       case 'shuffle-favs': shufflePlay(state.favorites); break;
       case 'shuffle-playlist': { const p = state.playlists.find(x => x.id === el.dataset.id); if (p) shufflePlay(p.trackUids); break; }
       case 'open-playlist': view = { kind: 'playlist', id: el.dataset.id }; keepScroll = false; render(); break;
+      case 'open-mymusic': view = { kind: 'mymusic' }; tab = 'playlists'; keepScroll = false; render(); break;
+      case 'shuffle-local': shufflePlay(localTracks().map(t => t.uid)); break;
+      case 'rename-playlist': {
+        const p = state.playlists.find(x => x.id === el.dataset.id);
+        if (!p) break;
+        const name = prompt('Rename playlist:', p.name);
+        if (name && name.trim()) { p.name = name.trim().slice(0, 80); save(); render(); }
+        break;
+      }
+      case 'pl-remove': {
+        const p = state.playlists.find(x => x.id === el.dataset.id);
+        if (p) { p.trackUids = p.trackUids.filter(x => x !== uid); save(); render(); }
+        break;
+      }
+      case 'pl-up': case 'pl-down': {
+        const p = state.playlists.find(x => x.id === el.dataset.id);
+        const i = Number(el.dataset.i);
+        const j = a === 'pl-up' ? i - 1 : i + 1;
+        if (p && j >= 0 && j < p.trackUids.length) {
+          const arr = p.trackUids.slice();
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+          p.trackUids = arr; save(); render();
+        }
+        break;
+      }
       case 'back': view = null; keepScroll = false; render(); break;
       case 'new-playlist': {
         const name = prompt('Playlist name:');
@@ -1274,6 +1673,27 @@
         break;
       }
       case 'test-jamendo': testJamendo(); break;
+      case 'manage-local': openLocalManager(); break;
+      case 'clear-local':
+        if (confirm('Delete ALL imported music from Tempo?\n\nYour original files on the device are not touched.')) clearLocalLibrary();
+        break;
+      case 'del-local':
+        deleteLocalTrack(uid).then(() => { closeSheet(); toast('Deleted.'); });
+        break;
+      case 'edit-track': openEditor(uid); break;
+      case 'save-edit': {
+        const t = track(el.dataset.uid);
+        if (t) {
+          const g = s => (document.querySelector(s)?.value || '').trim().slice(0, 300);
+          const ti = g('#ed-title');
+          t.title = ti || t.title;
+          t.artist = g('#ed-artist');
+          t.album = g('#ed-album');
+          save(); render(); updateMediaSession();
+        }
+        closeSheet(); toast('Saved.');
+        break;
+      }
       case 'toggle-debug': {
         const on = searchDebugOn();
         try { on ? localStorage.removeItem(DEBUG_KEY) : localStorage.setItem(DEBUG_KEY, '1'); } catch {}
@@ -1298,6 +1718,7 @@
     if (ctx === 'history') return state.history.slice();
     if (ctx === 'search') return search.results.map(t => t.uid);
     if (ctx === 'recent-added') return Object.values(state.tracks).sort((a, b) => b.addedAt - a.addedAt).map(t => t.uid);
+    if (ctx === 'mymusic') return localTracks().sort((a, b) => b.addedAt - a.addedAt).map(t => t.uid);
     if (ctx.startsWith('playlist:')) {
       const p = state.playlists.find(x => x.id === ctx.slice(9));
       return p ? p.trackUids.slice() : [];
@@ -1312,7 +1733,10 @@
       e.target.value = '';
     }
     if (e.target.id === 'local-file') {
-      if (e.target.files && e.target.files.length) addLocalFiles([...e.target.files]);
+      if (e.target.files && e.target.files.length) {
+        toast('Importing ' + e.target.files.length + ' file' + (e.target.files.length === 1 ? '' : 's') + '…');
+        importLocalFiles([...e.target.files]).then(refreshStorageLine);
+      }
       e.target.value = '';
     }
   });
@@ -1342,8 +1766,11 @@
       <button data-action="fav" data-uid="${esc(uid)}">${isFav(uid) ? '♥ Remove favorite' : '♡ Add to favorites'}</button>
       <button data-action="queue" data-uid="${esc(uid)}">☷ Add to queue</button>
       <button data-action="add-pl" data-uid="${esc(uid)}">+ Add to playlist</button>
+      ${inLib ? `<button data-action="edit-track" data-uid="${esc(uid)}">&#9998; Edit details</button>` : ''}
       ${t.url ? `<a href="${esc(t.url)}" target="_blank" rel="noreferrer">↗ Open on ${esc(providers[t.provider].label)}</a>` : ''}
-      ${inLib ? `<button class="danger" data-action="remove" data-uid="${esc(uid)}">Remove from library</button>` : ''}
+      ${inLib && t.provider === 'local'
+        ? `<button class="danger" data-action="del-local" data-uid="${esc(uid)}">Delete file from Tempo</button>`
+        : (inLib ? `<button class="danger" data-action="remove" data-uid="${esc(uid)}">Remove from library</button>` : '')}
       <button data-action="close-sheet">Cancel</button>`);
   }
 
@@ -1359,6 +1786,51 @@
     }
     sheet(`<div class="sheet-title">Add to playlist</div>
       ${state.playlists.map(p => `<button data-action="pick-pl" data-id="${esc(p.id)}" data-uid="${esc(uid)}">${esc(p.name)} <em>${p.trackUids.length}</em></button>`).join('')}
+      <button data-action="close-sheet">Cancel</button>`);
+  }
+
+  async function refreshStorageLine() {
+    const el = document.querySelector('#storage-line');
+    if (!el) return;
+    const n = localTracks().length;
+    let line = n + ' imported';
+    try {
+      const used = await idbTotalBytes();
+      if (used) line += ' · ' + bytes(used) + ' in Tempo';
+    } catch {}
+    if (navigator.storage && navigator.storage.estimate) {
+      try {
+        const est = await navigator.storage.estimate();
+        if (est && est.quota) line += ' · browser quota ' + bytes(est.quota);
+      } catch {}
+    }
+    const cur = document.querySelector('#storage-line');
+    if (cur) cur.textContent = line;
+  }
+
+  function openLocalManager() {
+    const list = localTracks().sort((a, b) => b.addedAt - a.addedAt);
+    if (!list.length) { toast('No imported music yet.'); return; }
+    sheet(`<div class="sheet-title">Imported music (${list.length})</div>
+      <div class="mgr">${list.map(t => `<div class="mgr-row">
+        <div class="mgr-txt"><b>${esc(t.title)}</b><em>${esc(t.artist || '—')}${t.fileSize ? ' · ' + bytes(t.fileSize) : ''}${t.missing ? ' · FILE MISSING' : ''}</em></div>
+        <button data-action="edit-track" data-uid="${esc(t.uid)}" aria-label="Edit">&#9998;</button>
+        <button class="danger" data-action="del-local" data-uid="${esc(t.uid)}" aria-label="Delete">&times;</button>
+      </div>`).join('')}</div>
+      <button data-action="close-sheet">Done</button>`);
+  }
+
+  function openEditor(uid) {
+    const t = track(uid);
+    if (!t) return;
+    sheet(`<div class="sheet-title">Edit details</div>
+      <label class="ed-l">Title</label>
+      <input id="ed-title" class="settings-input" value="${esc(t.title)}">
+      <label class="ed-l">Artist</label>
+      <input id="ed-artist" class="settings-input" value="${esc(t.artist || '')}">
+      <label class="ed-l">Album</label>
+      <input id="ed-album" class="settings-input" value="${esc(t.album || '')}">
+      <button class="primary-sheet" data-action="save-edit" data-uid="${esc(uid)}">Save</button>
       <button data-action="close-sheet">Cancel</button>`);
   }
 
@@ -1413,9 +1885,16 @@
     },
     setContext: l => { playContext = l; },
     fromAudius, playableAudius,
+    // local-library surface, for the automated QA pass
+    idb, idbGetBlob, idbKeys, idbTotalBytes, idbClear,
+    importLocalFiles, deleteLocalTrack, clearLocalLibrary, localTracks,
+    searchLocal, fromFileName, readTags, canPlayFile, reconcileLocalLibrary,
+    get localUrls() { return localUrls; },
     render
   };
 
   save();
   render();
+  reconcileLocalLibrary();
+  refreshStorageLine();
 })();
