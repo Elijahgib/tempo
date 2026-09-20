@@ -204,3 +204,24 @@ img{display:block}
 .mgr-row button.danger{color:var(--err)}
 .ed-l{font-size:11.5px;color:var(--dim2);margin:8px 0 5px;display:block}
 .primary-sheet{background:var(--accent)!important;color:#1a0d04!important;border-radius:10px;font-weight:800;justify-content:center!important;margin-top:12px;border:0!important}
+
+/* V0.7 — Musi migration, match review */
+.tag-review{background:#3a2a1a;color:#ffc46b;border:1px solid #5a452a}
+.tag-ytonly{background:#2a1f1f;color:#e08c8c;border:1px solid #452e2e}
+.tag-ok{background:#16301f;color:#7fe0a0;border:1px solid #27502f}
+.linkout{color:var(--accent);word-break:break-all;font-size:11.5px}
+.sheet-copy{color:var(--dim);font-size:12.5px;line-height:1.55;margin:0 0 12px;padding:0 2px}
+textarea.settings-input{resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.45}
+.rv{padding:14px 15px;margin-bottom:12px}
+.rv-lab{display:block;font-size:10px;letter-spacing:.7px;text-transform:uppercase;color:var(--dim2);font-weight:800;margin-bottom:4px}
+.rv-from{padding-bottom:11px;border-bottom:1px solid var(--line)}
+.rv-from b{font-size:14.5px;display:block}
+.rv-from em,.rv-cand em{font-style:normal;color:var(--dim);font-size:12.5px;display:block;margin-top:2px}
+.rv-to{padding-top:11px}
+.rv-cand{display:grid;grid-template-columns:44px 1fr;gap:10px;align-items:center}
+.rv-cand img,.rv-ph{width:44px;height:44px;border-radius:6px;object-fit:cover;background:#1c1c20}
+.rv-cand b{font-size:14px;display:block}
+.rv-why{display:block;font-size:10.5px;color:var(--dim2);margin-top:3px;line-height:1.35}
+.rv-acts{display:flex;flex-wrap:wrap;gap:7px;margin-top:13px}
+.rv-acts button{flex:1 1 auto;min-width:88px;padding:9px 6px;border-radius:9px;border:1px solid var(--line);background:var(--bg2);font-size:12px;font-weight:700}
+.rv-acts button:first-child{background:var(--accent);color:#1a0d04;border-color:var(--accent)}
