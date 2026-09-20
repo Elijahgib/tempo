@@ -20,6 +20,14 @@
   // Kept in localStorage, never in the repo — this is a public GitHub Pages site.
   const JAMENDO_KEY = 'tempo-jamendo-client-id';
   const DEBUG_KEY = 'tempo-search-debug';
+  // Base URL of the Tempo Worker (OAuth signing + Musi fetch). No secret is
+  // ever held in this file — only the public address of the backend.
+  const WORKER_KEY = 'tempo-worker-base';
+  let amBackendUp = null;   // null = unknown, true/false after a health probe
+
+  function workerBase() {
+    try { return (localStorage.getItem(WORKER_KEY) || '').replace(/\/+$/, ''); } catch { return ''; }
+  }
   const ID_RE = /^[A-Za-z0-9_-]{11}$/;
   const YT_HOSTS = ['youtube.com','www.youtube.com','m.youtube.com','music.youtube.com','youtu.be','www.youtu.be','youtube-nocookie.com','www.youtube-nocookie.com'];
   const FATAL_YT = [2, 5, 100, 101, 150];
@@ -81,23 +89,40 @@
     for (const [uid, t] of Object.entries(s.tracks)) {
       if (!t || typeof t !== 'object') { delete s.tracks[uid]; continue; }
       t.uid = uid;
-      // The uid prefix is authoritative: it repairs rows written by a build whose
-      // provider allow-list was missing a provider (which rewrote them to youtube).
+      // For direct-provider uids the prefix is authoritative — it repairs rows
+      // written by a build whose allow-list was missing a provider. Imported
+      // "musi:" tracks are different: their identity is the source video, while
+      // playback may be re-pointed at any provider by the matcher.
       const fromUid = uid.slice(0, uid.indexOf(':'));
-      const known = ['audius','jamendo','local','youtube'];
-      t.provider = known.includes(fromUid) ? fromUid
-        : (known.includes(t.provider) ? t.provider : 'youtube');
+      const known = ['audius','jamendo','local','youtube','audiomack'];
+      if (fromUid === 'musi') {
+        t.provider = known.includes(t.provider) ? t.provider : 'youtube';
+      } else {
+        t.provider = known.includes(fromUid) ? fromUid
+          : (known.includes(t.provider) ? t.provider : 'youtube');
+      }
       t.artist = t.artist || '';
       t.duration = Number.isFinite(t.duration) ? t.duration : 0;
     }
     const live = a => (Array.isArray(a) ? a : []).filter(u => s.tracks[u]);
     s.favorites = live(s.favorites); s.queue = live(s.queue); s.history = live(s.history);
-    s.playlists = (Array.isArray(s.playlists) ? s.playlists : []).map(p => ({
-      id: String(p.id || uuid()),
-      name: String(p.name || 'Playlist').slice(0, 80),
-      trackUids: live(p.trackUids),
-      createdAt: Number.isFinite(p.createdAt) ? p.createdAt : Date.now()
-    }));
+    s.playlists = (Array.isArray(s.playlists) ? s.playlists : []).map(p => {
+      const out = {
+        id: String(p.id || uuid()),
+        name: String(p.name || 'Playlist').slice(0, 80),
+        trackUids: live(p.trackUids),
+        createdAt: Number.isFinite(p.createdAt) ? p.createdAt : Date.now()
+      };
+      // Import provenance must survive a reload, or re-importing the same Musi
+      // playlist would create a duplicate instead of reconciling.
+      if (p.sourceOrigin === 'musi') {
+        out.sourceOrigin = 'musi';
+        if (typeof p.sourceCode === 'string') out.sourceCode = p.sourceCode.slice(0, 120);
+        if (typeof p.sourceUrl === 'string' && /^https:\/\//.test(p.sourceUrl)) out.sourceUrl = p.sourceUrl.slice(0, 300);
+        if (Number.isFinite(p.importedAt)) out.importedAt = p.importedAt;
+      }
+      return out;
+    });
     return s;
   }
 
@@ -194,6 +219,34 @@
       }
     },
 
+    // Audiomack requires OAuth 1.0a signing, which cannot happen in a public
+    // static page — every call goes through the Tempo Worker, which holds the
+    // consumer secret. Disabled entirely until that backend is configured.
+    audiomack: {
+      id: 'audiomack', label: 'Audiomack', background: true,
+      get enabled() { return !!workerBase() && amBackendUp === true; },
+      async search(q) {
+        const base = workerBase();
+        if (!base) return [];
+        const r = await fetch(`${base}/audiomack/search?q=${encodeURIComponent(q)}&limit=25`);
+        if (!r.ok) throw new Error('Audiomack search failed (' + r.status + ')');
+        const j = await r.json();
+        return (j.results || []).filter(playableAudiomack).map(fromAudiomack);
+      },
+      // Audiomack stream URLs expire in ~10 seconds, so they are requested
+      // immediately before playback and never stored.
+      async resolveStream(t) {
+        const base = workerBase();
+        if (!base) throw new Error('Audiomack backend is not configured.');
+        const r = await fetch(`${base}/audiomack/stream/${encodeURIComponent(t.providerTrackId)}`);
+        if (!r.ok) throw new Error('Could not get that Audiomack stream.');
+        const j = await r.json();
+        if (!j.url) throw new Error('Audiomack returned no stream.');
+        return j.url;
+      },
+      streamUrl() { return ''; }   // always resolved fresh
+    },
+
     local: {
       id: 'local', label: 'My Music', background: true, offline: true,
       streamUrl(t) { return localUrls.get(t.uid) || ''; },
@@ -242,6 +295,26 @@
       playCount: Number(t.play_count) || 0,
       favoriteCount: Number(t.favorite_count) || 0,
       repostCount: Number(t.repost_count) || 0
+    };
+  }
+
+  function playableAudiomack(t) { return t && t.id && t.title && t.streamable !== false; }
+
+  function fromAudiomack(t) {
+    return {
+      uid: 'audiomack:' + t.id,
+      provider: 'audiomack',
+      providerTrackId: String(t.id),
+      title: String(t.title || 'Untitled').slice(0, 300),
+      artist: String(t.artist || '').slice(0, 150),
+      album: String(t.album || '').slice(0, 150),
+      artwork: /^https:\/\//.test(t.image || '') ? t.image : '',
+      duration: Number(t.duration) || 0,
+      url: /^https:\/\//.test(t.url || '') ? t.url : 'https://audiomack.com',
+      addedAt: Date.now(),
+      playCount: Number(t.plays) || 0,
+      favoriteCount: Number(t.favorites) || 0,
+      repostCount: Number(t.reposts) || 0
     };
   }
 
@@ -656,6 +729,395 @@
 
   function searchDebugOn() { try { return localStorage.getItem(DEBUG_KEY) === '1'; } catch { return false; } }
 
+  /* =========================================================================
+     Musi migration — import a PUBLIC playlist the user supplies.
+     Only ever touches a URL the user pastes. No crawling, no enumeration,
+     no private data, no audio is downloaded from anywhere.
+     ========================================================================= */
+
+  const MUSI_API = code => `https://feelthemusi.com/api/v4/playlists/fetch/${encodeURIComponent(code)}`;
+
+  // Accepts a share URL or a bare code. Returns the playlist code or null.
+  function musiCode(input) {
+    const v = String(input || '').trim();
+    if (!v) return null;
+    if (/^[A-Za-z0-9_-]{3,120}$/.test(v)) return v;          // bare code
+    let url;
+    try { url = new URL(/^[a-z]+:\/\//i.test(v) ? v : 'https://' + v); } catch { return null; }
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+    if (host !== 'feelthemusi.com') return null;
+    const m = url.pathname.match(/^\/playlist\/([^/?#]+)/);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]).trim() || null; } catch { return m[1]; }
+  }
+
+  // The Musi endpoint sends no CORS headers, so the browser cannot read it
+  // directly. Route 1 is the Tempo Worker; route 2 is a manual paste of the
+  // JSON. No third-party CORS proxy is used.
+  async function musiFetch(code) {
+    const base = workerBase();
+    if (!base) throw new Error('NO_BACKEND');
+    const r = await fetch(`${base}/musi/${encodeURIComponent(code)}`, { headers: { 'accept': 'application/json' } });
+    if (!r.ok) throw new Error('Tempo backend returned ' + r.status);
+    return r.json();
+  }
+
+  // Parses the Musi payload. Tolerates the raw API response, or the same JSON
+  // pasted by hand. Never eval'd — JSON.parse only, then field-by-field rebuild.
+  function musiParse(payload) {
+    let root = payload;
+    if (typeof root === 'string') {
+      try { root = JSON.parse(root); } catch { throw new Error('That is not valid JSON.'); }
+    }
+    if (!root || typeof root !== 'object') throw new Error('Unexpected Musi response.');
+
+    const success = root.success || root;
+    let inner = success.data;
+    if (typeof inner === 'string') {
+      try { inner = JSON.parse(inner); } catch { throw new Error('Musi playlist data could not be read.'); }
+    }
+    if (!inner || !Array.isArray(inner.data)) throw new Error('No tracks found in that playlist.');
+
+    const name = String(inner.title || success.title || 'Musi playlist').slice(0, 120);
+    const items = [];
+    const seen = new Set();
+    for (const raw of inner.data.slice(0, 5000)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const vid = String(raw.video_id || '').trim();
+      if (!ID_RE.test(vid) || seen.has(vid)) continue;       // dedupe within the playlist
+      seen.add(vid);
+      items.push({
+        videoId: vid,
+        title: String(raw.video_name || '').slice(0, 300) || ('YouTube ' + vid),
+        artist: String(raw.video_creator || '').slice(0, 150),
+        duration: Number.isFinite(raw.video_duration) ? Number(raw.video_duration) : 0,
+        order: items.length
+      });
+    }
+    if (!items.length) throw new Error('No playable tracks found in that playlist.');
+    return { name, code: String(success.code || '').slice(0, 120), items };
+  }
+
+  /* ---------- title / artist normalisation (MATCHING ONLY) ---------- */
+
+  // Deliberately conservative. Strips production noise, keeps anything that
+  // changes which recording this is (feat./remix/live/part numbers/subtitles).
+  const NOISE = [
+    /\(\s*official\s+(music\s+)?video\s*\)/gi, /\[\s*official\s+(music\s+)?video\s*\]/gi,
+    /\(\s*official\s+audio\s*\)/gi, /\[\s*official\s+audio\s*\]/gi,
+    /\(\s*official\s+visuali[sz]er\s*\)/gi, /\[\s*official\s+visuali[sz]er\s*\]/gi,
+    /\(\s*official\s+lyric\s*video\s*\)/gi, /\[\s*official\s+lyric\s*video\s*\]/gi,
+    /\(\s*lyric[s]?\s*(video)?\s*\)/gi, /\[\s*lyric[s]?\s*(video)?\s*\]/gi,
+    /\(\s*visuali[sz]er\s*\)/gi, /\[\s*visuali[sz]er\s*\]/gi,
+    /\(\s*audio\s*\)/gi, /\[\s*audio\s*\]/gi,
+    /\bofficial\s+(music\s+)?video\b/gi, /\bofficial\s+audio\b/gi,
+    /\blyric[s]?\s+video\b/gi, /\bvisuali[sz]er\b/gi,
+    /\b(4k|8k|hd|hq|full\s*hd)\b/gi,
+    /\(\s*prod\.?\s*by[^)]*\)/gi, /\[\s*prod\.?\s*by[^\]]*\]/gi,
+    /\bdir\.?\s*by\s+[^|)\]]+/gi,
+    /\|\s*a\s+\w+\s+film\b.*$/gi,
+    /\bshot\s+by\s+[^|)\]]+/gi
+  ];
+
+  // Markers that mean "a different recording" — never normalised away, and
+  // used to reject cross-version matches.
+  const VERSION_WORDS = ['remix','live','acoustic','instrumental','nightcore','slowed','reverb',
+    'sped up','speed up','chopped','screwed','cover','karaoke','8d','mashup','edit','bootleg',
+    'radio edit','extended','demo','snippet','freestyle','clean','dirty'];
+
+  function musiNormalizeTitle(raw) {
+    let s = String(raw || '');
+    for (const re of NOISE) s = s.replace(re, ' ');
+    s = s.replace(/\(\s*\)|\[\s*\]/g, ' ');
+    return tidy(s);
+  }
+
+  function musiNormalizeArtist(raw) {
+    let s = String(raw || '');
+    // Channel names are usually glued: "QuandoRondoVEVO", not "Quando Rondo VEVO".
+    s = s.replace(/vevo\s*$/i, ' ')
+         .replace(/\bvevo\b/gi, ' ')
+         .replace(/\s*-\s*topic\s*$/i, ' ')
+         .replace(/\bofficial\b/gi, ' ')
+         .replace(/\bmusic\s*$/i, ' ');
+    // Keep only the primary artist for matching; features are handled separately.
+    s = s.split(/\s*(?:,|&|\bx\b|\bft\.?\b|\bfeat\.?\b|\bwith\b)\s*/i)[0] || s;
+    return tidy(s);
+  }
+
+  function tidy(s) {
+    return String(s)
+      .replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
+      .replace(/\s+/g, ' ')
+      .replace(/\s*[-–—|]\s*$/, '')
+      .trim();
+  }
+
+  function featuredArtists(raw) {
+    const m = String(raw || '').match(/\b(?:ft\.?|feat\.?|featuring)\s+([^()\[\]|]+)/i);
+    if (!m) return [];
+    return m[1].split(/\s*(?:,|&|\bx\b|\band\b)\s*/i).map(x => norm(x)).filter(Boolean).slice(0, 5);
+  }
+
+  function versionTags(s) {
+    const n = norm(s);
+    return VERSION_WORDS.filter(w => new RegExp('\\b' + w.replace(/ /g, '\\s+') + '\\b').test(n));
+  }
+
+  /* ---------- matching engine ---------- */
+
+  const MATCH = { CONFIRMED: 'CONFIRMED', LIKELY: 'LIKELY', REVIEW: 'REVIEW', UNMATCHED: 'UNMATCHED' };
+
+  // Scores a candidate from a streaming provider against a Musi source track.
+  // Returns { score, reasons, blocked }.
+  function scoreCandidate(src, cand) {
+    const reasons = [];
+    const sTitle = norm(musiNormalizeTitle(src.title));
+    const sArtist = norm(musiNormalizeArtist(src.artist));
+    const cTitle = norm(musiNormalizeTitle(cand.title));
+    const cArtist = norm(musiNormalizeArtist(cand.artist));
+    if (!sTitle || !cTitle) return { score: 0, reasons: ['no title'], blocked: true };
+
+    // Hard reject: version mismatch (a remix is not the song).
+    const sv = versionTags(src.title), cv = versionTags(cand.title);
+    const svSet = sv.join('|'), cvSet = cv.join('|');
+    if (svSet !== cvSet) {
+      return { score: 0, reasons: ['version mismatch: "' + (svSet || 'original') + '" vs "' + (cvSet || 'original') + '"'], blocked: true };
+    }
+
+    let score = 0;
+    if (cTitle === sTitle) { score += 55; reasons.push('exact title'); }
+    else if (cTitle.startsWith(sTitle) || sTitle.startsWith(cTitle)) { score += 34; reasons.push('title prefix'); }
+    else {
+      const a = new Set(sTitle.split(' ')), b = new Set(cTitle.split(' '));
+      const inter = [...a].filter(w => b.has(w)).length;
+      const overlap = inter / Math.max(a.size, b.size);
+      if (overlap >= 0.8) { score += 24; reasons.push('title ' + Math.round(overlap * 100) + '% overlap'); }
+      else if (overlap >= 0.55) { score += 12; reasons.push('title ' + Math.round(overlap * 100) + '% overlap'); }
+      else return { score: 0, reasons: ['title too different'], blocked: true };
+    }
+
+    if (sArtist && cArtist) {
+      // Space-insensitive too, because YouTube channels glue names together
+      // ("QuandoRondo") while providers space them ("Quando Rondo").
+      const sq = sArtist.replace(/ /g, ''), cq = cArtist.replace(/ /g, '');
+      if (cArtist === sArtist || cq === sq) { score += 35; reasons.push('exact artist'); }
+      else if (cq.includes(sq) || sq.includes(cq)) { score += 22; reasons.push('artist contains'); }
+      else {
+        const feats = featuredArtists(src.title).concat(featuredArtists(src.artist));
+        if (feats.some(f => cArtist.includes(f) || f.includes(cArtist))) { score += 14; reasons.push('featured artist'); }
+        else { score -= 18; reasons.push('artist mismatch'); }
+      }
+    } else if (!sArtist) { reasons.push('no source artist'); }
+
+    // Duration agreement is strong evidence it is the same recording.
+    if (src.duration > 0 && cand.duration > 0) {
+      const d = Math.abs(src.duration - cand.duration);
+      if (d <= 3) { score += 14; reasons.push('duration ±' + d + 's'); }
+      else if (d <= 8) { score += 8; reasons.push('duration ±' + d + 's'); }
+      else if (d <= 20) { reasons.push('duration ±' + d + 's'); }
+      else { score -= 20; reasons.push('duration off by ' + d + 's'); }
+    }
+
+    // Small tiebreak only — popularity must never rescue a weak text match.
+    const eng = Math.log10(1 + (cand.playCount || 0));
+    score += Math.min(6, eng);
+
+    return { score: Math.round(score), reasons, blocked: false };
+  }
+
+  // Thresholds are deliberately strict: a wrong recording is worse than no match.
+  function confidenceFor(score, best, runnerUp) {
+    if (score >= 92) return MATCH.CONFIRMED;
+    if (score >= 74) {
+      // If a close rival exists we are not actually confident which is right.
+      if (runnerUp && best - runnerUp < 8) return MATCH.REVIEW;
+      return MATCH.LIKELY;
+    }
+    if (score >= 45) return MATCH.REVIEW;
+    return MATCH.UNMATCHED;
+  }
+
+  async function matchTrack(src) {
+    const candidates = [];
+    const tried = [];
+
+    for (const p of matchProviders()) {
+      let list = [];
+      try {
+        list = await p.search(`${src.artist} ${musiNormalizeTitle(src.title)}`.trim());
+        tried.push(p.id + ':' + list.length);
+      } catch (e) { tried.push(p.id + ':err'); continue; }
+      for (const c of list.slice(0, 25)) {
+        const s = scoreCandidate(src, c);
+        if (!s.blocked) candidates.push({ cand: c, ...s });
+      }
+      // A CONFIRMED hit from a higher-priority provider ends the search.
+      if (candidates.some(c => c.score >= 92)) break;
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    const runner = candidates[1];
+    if (!best) return { status: MATCH.UNMATCHED, candidates: [], tried };
+    const status = confidenceFor(best.score, best.score, runner && runner.score);
+    return { status, best, candidates: candidates.slice(0, 5), tried };
+  }
+
+  /* ---------- import orchestration ---------- */
+
+  // Imported tracks keep a stable identity from the source video id, so the
+  // playback provider can change later without breaking playlist references.
+  const musiUid = videoId => 'musi:' + videoId;
+
+  function musiTrackRecord(src, playlistName, code) {
+    return {
+      uid: musiUid(src.videoId),
+      provider: 'youtube',                 // always playable immediately
+      providerTrackId: src.videoId,
+      title: src.title,
+      artist: src.artist,
+      artwork: ytThumb(src.videoId),
+      duration: src.duration || 0,
+      url: ytWatch(src.videoId),
+      addedAt: Date.now(),
+      // provenance — preserved for good, even after a match replaces playback
+      sourceOrigin: 'musi',
+      sourcePlaylistName: playlistName,
+      sourcePlaylistCode: code,
+      sourceTitle: src.title,
+      sourceArtist: src.artist,
+      sourceUrl: ytWatch(src.videoId),
+      sourceVideoId: src.videoId,
+      sourceDuration: src.duration || 0,
+      matchStatus: MATCH.UNMATCHED
+    };
+  }
+
+  function applyMatch(uid, result) {
+    const t = track(uid);
+    if (!t) return;
+    t.matchStatus = result.status;
+    t.matchCandidates = (result.candidates || []).map(c => ({
+      uid: c.cand.uid, provider: c.cand.provider, title: c.cand.title,
+      artist: c.cand.artist, artwork: c.cand.artwork, duration: c.cand.duration,
+      score: c.score, reasons: c.reasons
+    }));
+    // Only CONFIRMED and LIKELY switch playback away from YouTube. Anything
+    // else keeps YouTube and waits for the user.
+    if ((result.status === MATCH.CONFIRMED || result.status === MATCH.LIKELY) && result.best) {
+      adoptCandidate(t, result.best.cand, result.best.score);
+    }
+  }
+
+  function adoptCandidate(t, cand, score) {
+    t.provider = cand.provider;
+    t.providerTrackId = cand.providerTrackId;
+    t.title = cand.title;
+    t.artist = cand.artist;
+    if (cand.artwork) t.artwork = cand.artwork;
+    if (cand.duration) t.duration = cand.duration;
+    t.matchProvider = cand.provider;
+    t.matchScore = score;
+    t.url = cand.url || t.url;
+    if (cand.provider === 'jamendo' || cand.provider === 'audiomack') streamRefs.delete(t.uid);
+  }
+
+  function revertToYouTube(t) {
+    t.provider = 'youtube';
+    t.providerTrackId = t.sourceVideoId;
+    t.title = t.sourceTitle;
+    t.artist = t.sourceArtist;
+    t.artwork = ytThumb(t.sourceVideoId);
+    t.duration = t.sourceDuration || 0;
+    t.url = ytWatch(t.sourceVideoId);
+    delete t.matchProvider; delete t.matchScore;
+  }
+
+  let importJob = null;   // { name, code, items, done, total, stats, playlistId, cancelled }
+
+  async function musiImport(parsed, opts = {}) {
+    const existingPl = state.playlists.find(p => p.sourceCode === parsed.code);
+    const stats = { total: parsed.items.length, added: 0, already: 0, confirmed: 0, likely: 0, review: 0, unmatched: 0, changed: 0 };
+
+    // 1. Create/locate the Tempo playlist and record every track first, so the
+    //    import is usable (YouTube) even if matching is interrupted.
+    const uids = [];
+    for (const src of parsed.items) {
+      const uid = musiUid(src.videoId);
+      const had = !!state.tracks[uid];
+      if (had) {
+        stats.already++;
+        const t = state.tracks[uid];
+        t.sourcePlaylistName = parsed.name;
+        t.sourcePlaylistCode = parsed.code;
+      } else {
+        addTrack(musiTrackRecord(src, parsed.name, parsed.code));
+        stats.added++;
+      }
+      uids.push(uid);
+    }
+
+    let pl;
+    if (existingPl) {
+      // Reconcile: keep Tempo-side additions, adopt source ordering, and never
+      // delete anything just because the source no longer lists it.
+      const removedFromSource = existingPl.trackUids.filter(u => !uids.includes(u));
+      pl = existingPl;
+      pl.trackUids = uids.concat(removedFromSource);
+      pl.name = parsed.name;
+      pl.importedAt = Date.now();
+      stats.removedFromSource = removedFromSource.length;
+    } else {
+      pl = { id: uuid(), name: parsed.name, trackUids: uids, createdAt: Date.now(),
+             importedAt: Date.now(), sourceOrigin: 'musi', sourceCode: parsed.code,
+             sourceUrl: 'https://feelthemusi.com/playlist/' + parsed.code };
+      state.playlists = [pl, ...state.playlists];
+    }
+    save(); render();
+
+    // 2. Match in the background, newest-first, updating as we go.
+    importJob = { name: parsed.name, code: parsed.code, done: 0, total: uids.length, stats, playlistId: pl.id, cancelled: false };
+    if (opts.match === false) { importJob = null; return { stats, playlistId: pl.id }; }
+
+    for (const uid of uids) {
+      if (!importJob || importJob.cancelled) break;
+      const t = track(uid);
+      if (!t) { importJob.done++; continue; }
+      if (t.matchStatus && t.matchStatus !== MATCH.UNMATCHED) { importJob.done++; continue; }
+      const before = t.matchProvider;
+      try {
+        const res = await matchTrack({ title: t.sourceTitle, artist: t.sourceArtist, duration: t.sourceDuration });
+        applyMatch(uid, res);
+        if (res.status === MATCH.CONFIRMED) stats.confirmed++;
+        else if (res.status === MATCH.LIKELY) stats.likely++;
+        else if (res.status === MATCH.REVIEW) stats.review++;
+        else stats.unmatched++;
+        if (before && t.matchProvider && before !== t.matchProvider) stats.changed++;
+      } catch { stats.unmatched++; }
+      importJob.done++;
+      if (importJob.done % 3 === 0) { save(); if (tab === 'more' || view) render(); }
+      await new Promise(r => setTimeout(r, 120));   // be polite to the providers
+    }
+    save();
+    importJob = null;
+    render();
+    return { stats, playlistId: pl.id };
+  }
+
+  function reviewQueue() {
+    return Object.values(state.tracks).filter(t => t.sourceOrigin === 'musi' && t.matchStatus === MATCH.REVIEW);
+  }
+
+  // Priority order, skipping anything not currently usable.
+  function matchProviders() {
+    const out = [];
+    if (providers.audiomack.enabled) out.push(providers.audiomack);
+    out.push(providers.audius);
+    if (providers.jamendo.enabled) out.push(providers.jamendo);
+    return out;
+  }
+
   // Your own files: matched locally, instantly, and given a standing bonus so a
   // track you actually own outranks a streaming near-match of equal text score.
   // Deliberately above the 30-point engagement ceiling: at equal text relevance
@@ -838,7 +1300,9 @@
         toast('YouTube playback pauses when Tempo is backgrounded.');
         try { localStorage.setItem(YT_NOTICE_KEY, '1'); } catch {}
       }
-      if (opts.open !== false) nowPlaying = true;
+      // YouTube can only play inside its visible iframe, so the sheet must open
+      // even on auto-advance — otherwise the track would sit silent.
+      nowPlaying = true;
       render();
     } else {
       ytDestroy();
@@ -1193,6 +1657,16 @@
     return '';
   }
 
+  // Status for imported Musi tracks: shows at a glance whether a song will
+  // survive the screen locking.
+  function matchBadge(t) {
+    if (t.sourceOrigin !== 'musi') return '';
+    if (t.matchStatus === MATCH.REVIEW) return '<span class="tag tag-review">&#9888; REVIEW</span>';
+    if (t.provider === 'youtube') return '<span class="tag tag-ytonly">YOUTUBE ONLY</span>';
+    if (t.matchStatus === MATCH.CONFIRMED || t.matchStatus === MATCH.LIKELY) return '<span class="tag tag-ok">&#10003;</span>';
+    return '';
+  }
+
   function plays(n) {
     if (!n) return '';
     if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M plays';
@@ -1218,7 +1692,7 @@
       ${art(t)}
       <div class="row-txt">
         <div class="row-title">${esc(t.title)}${t.missing ? ' <span class="tag tag-miss">MISSING</span>' : ''}${off ? ' <span class="tag tag-miss">NEEDS INTERNET</span>' : ''}</div>
-        <div class="row-sub">${badge(t, opts.showSource)}${esc(t.artist || providers[t.provider].label)}${t.duration ? ' · ' + fmt(t.duration) : ''}${opts.showSource && t.playCount ? ' · ' + plays(t.playCount) : ''}</div>
+        <div class="row-sub">${badge(t, opts.showSource)}${matchBadge(t)}${esc(t.artist || providers[t.provider].label)}${t.duration ? ' · ' + fmt(t.duration) : ''}${opts.showSource && t.playCount ? ' · ' + plays(t.playCount) : ''}</div>
         ${opts.debug ? debugLine(t) : ''}
       </div>
       <button class="row-btn" data-action="menu" data-uid="${esc(t.uid)}" aria-label="More">&#8942;</button>
@@ -1251,6 +1725,33 @@
   }
 
   function viewPlaylists() {
+    if (view && view.kind === 'review') {
+      const q = reviewQueue();
+      return `<div class="head">
+          <button class="back" data-action="back">&#8592;</button>
+          <h1>Review matches</h1>
+          <div class="head-sub">${q.length} uncertain</div>
+        </div>
+        ${q.length ? q.slice(0, 40).map(t => {
+          const c = (t.matchCandidates || [])[0];
+          return `<div class="rv card">
+            <div class="rv-from"><span class="rv-lab">From Musi</span><b>${esc(t.sourceTitle)}</b><em>${esc(t.sourceArtist || '—')}${t.sourceDuration ? ' · ' + fmt(t.sourceDuration) : ''}</em></div>
+            ${c ? `<div class="rv-to">
+              <span class="rv-lab">Proposed ${esc(c.provider)}</span>
+              <div class="rv-cand">${c.artwork ? `<img src="${esc(c.artwork)}" alt="" loading="lazy">` : '<div class="rv-ph"></div>'}
+                <div><b>${esc(c.title)}</b><em>${esc(c.artist || '—')}${c.duration ? ' · ' + fmt(c.duration) : ''}</em>
+                <span class="rv-why">score ${c.score} · ${esc((c.reasons || []).join(', '))}</span></div></div>
+            </div>` : '<div class="rv-to"><span class="rv-lab">No candidate found</span></div>'}
+            <div class="rv-acts">
+              ${c ? `<button data-action="rv-use" data-uid="${esc(t.uid)}" data-i="0">Use match</button>` : ''}
+              ${(t.matchCandidates || []).length > 1 ? `<button data-action="rv-next" data-uid="${esc(t.uid)}">Try another</button>` : ''}
+              <button data-action="rv-keep-yt" data-uid="${esc(t.uid)}">Keep YouTube</button>
+              <button data-action="rv-unmatched" data-uid="${esc(t.uid)}">Leave</button>
+            </div>
+          </div>`;
+        }).join('') : '<div class="empty">Nothing to review.<br><span>Every imported track is either matched or kept on YouTube.</span></div>'}`;
+    }
+
     if (view && view.kind === 'mymusic') {
       const list = localTracks().sort((a, b) => b.addedAt - a.addedAt);
       return `<div class="head">
@@ -1368,6 +1869,26 @@
         <p class="tiny warn-note">iOS can evict browser storage if the device runs very low on space. Tempo cannot prevent that — keep your originals in Files or iCloud.</p>
       </div>
       <div class="panel">
+        <h3>Import from Musi</h3>
+        <p>Paste a <b>public</b> Musi share link. Tempo reads that one playlist, keeps its order, and tries to find a background-playable version of each song.</p>
+        <input id="musi-url" class="settings-input" type="url" placeholder="https://feelthemusi.com/playlist/..."
+          autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url">
+        <button data-action="musi-import">Import playlist</button>
+        <div id="musi-status" class="settings-status"></div>
+        ${reviewQueue().length ? `<button style="margin-top:9px" data-action="open-review">Review ${reviewQueue().length} uncertain match${reviewQueue().length === 1 ? '' : 'es'}</button>` : ''}
+      </div>
+      <div class="panel">
+        <h3>Tempo backend</h3>
+        <p>Optional. Needed for Audiomack, and for one-tap Musi import. Without it you can still import by pasting the playlist data.</p>
+        <input id="worker-url" class="settings-input" type="url" placeholder="https://tempo-api.<you>.workers.dev"
+          autocapitalize="off" autocorrect="off" spellcheck="false" value="${esc(workerBase())}">
+        <div class="two">
+          <button data-action="save-worker">Save</button>
+          <button data-action="test-worker">Test</button>
+        </div>
+        <div id="worker-status" class="settings-status">${workerBase() ? 'Configured.' : 'Not set — Audiomack off, Musi import uses manual paste.'}</div>
+      </div>
+      <div class="panel">
         <h3>Jamendo</h3>
         <p>A second free catalogue. Needs your own free client ID &mdash; it is stored only in this browser, never in the app's public source.</p>
         <ol class="steps">
@@ -1390,6 +1911,8 @@
       </div>
       <div class="panel">
         <h3>Providers</h3>
+        <div class="prov"><b>Audiomack</b><span class="${providers.audiomack.enabled ? 'ok' : 'warn'}">${providers.audiomack.enabled ? 'Background playback' : 'Needs backend + credentials'}</span></div>
+        <p class="tiny">Requires the Tempo backend and Audiomack API credentials.</p>
         <div class="prov"><b>Audius</b><span class="ok">Background playback</span></div>
         <p class="tiny">Free, open music streaming. No account required.</p>
         <div class="prov"><b>Jamendo</b><span class="${providers.jamendo.enabled ? 'ok' : 'warn'}">${providers.jamendo.enabled ? 'Background playback' : 'Needs a client ID'}</span></div>
@@ -1405,7 +1928,7 @@
       </div>
       <div class="panel">
         <h3>About</h3>
-        <p class="tiny">Tempo ${'0.6.3'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
+        <p class="tiny">Tempo ${'0.7.3'} · ${Object.keys(state.tracks).length} tracks · ${state.playlists.length} playlists${state.migratedFrom ? ' · migrated from ' + state.migratedFrom : ''}</p>
       </div>`;
   }
 
@@ -1676,6 +2199,52 @@
         break;
       }
       case 'test-jamendo': testJamendo(); break;
+      case 'save-worker': {
+        const v = (document.querySelector('#worker-url')?.value || '').trim();
+        if (v && !/^https:\/\//i.test(v)) { toast('Backend URL must start with https://', true); break; }
+        try { v ? localStorage.setItem(WORKER_KEY, v) : localStorage.removeItem(WORKER_KEY); } catch {}
+        amBackendUp = null;
+        render(); toast(v ? 'Backend saved.' : 'Backend cleared.');
+        break;
+      }
+      case 'test-worker': testWorker(); break;
+      case 'musi-import': startMusiImport(); break;
+      case 'musi-paste': openMusiPaste(); break;
+      case 'musi-paste-go': {
+        const raw = (document.querySelector('#musi-json')?.value || '').trim();
+        closeSheet();
+        if (raw) runMusiParse(raw);
+        break;
+      }
+      case 'open-review': view = { kind: 'review' }; tab = 'playlists'; keepScroll = false; render(); break;
+      case 'rv-use': {
+        const t = track(uid); const idx = Number(el.dataset.i) || 0;
+        const c = t && t.matchCandidates && t.matchCandidates[idx];
+        if (t && c) {
+          adoptCandidate(t, { ...c, providerTrackId: (c.uid || '').split(':').slice(1).join(':') }, c.score);
+          t.matchStatus = MATCH.CONFIRMED;
+          save(); render(); toast('Match applied.');
+        }
+        break;
+      }
+      case 'rv-next': {
+        const t = track(uid);
+        if (t && t.matchCandidates && t.matchCandidates.length > 1) {
+          t.matchCandidates.push(t.matchCandidates.shift());
+          save(); render();
+        } else toast('No other candidates.');
+        break;
+      }
+      case 'rv-keep-yt': {
+        const t = track(uid);
+        if (t) { revertToYouTube(t); t.matchStatus = 'YOUTUBE'; save(); render(); toast('Keeping YouTube.'); }
+        break;
+      }
+      case 'rv-unmatched': {
+        const t = track(uid);
+        if (t) { revertToYouTube(t); t.matchStatus = MATCH.UNMATCHED; t.matchCandidates = []; save(); render(); }
+        break;
+      }
       case 'manage-local': openLocalManager(); break;
       case 'clear-local':
         if (confirm('Delete ALL imported music from Tempo?\n\nYour original files on the device are not touched.')) clearLocalLibrary();
@@ -1800,6 +2369,12 @@
     try {
       const used = await idbTotalBytes();
       if (used) line += ' · ' + bytes(used) + ' in Tempo';
+      // Blobs can outlive their metadata if storage was cleared. Surface them
+      // rather than deleting anything automatically.
+      const keys = await idbKeys();
+      const known = new Set(localTracks().map(t => t.providerTrackId));
+      const orphans = (keys || []).filter(k => !known.has(k)).length;
+      if (orphans) line += ' · ' + orphans + ' orphaned file' + (orphans === 1 ? '' : 's');
     } catch {}
     if (navigator.storage && navigator.storage.estimate) {
       try {
@@ -1834,6 +2409,79 @@
       <label class="ed-l">Album</label>
       <input id="ed-album" class="settings-input" value="${esc(t.album || '')}">
       <button class="primary-sheet" data-action="save-edit" data-uid="${esc(uid)}">Save</button>
+      <button data-action="close-sheet">Cancel</button>`);
+  }
+
+  function musiStatus(msg, isErr) {
+    const el = document.querySelector('#musi-status');
+    if (el) { el.textContent = msg; el.className = 'settings-status' + (isErr ? ' is-error' : ''); }
+  }
+
+  async function testWorker() {
+    const el = document.querySelector('#worker-status');
+    const v = (document.querySelector('#worker-url')?.value || '').trim().replace(/\/+$/, '');
+    if (!v) { if (el) el.textContent = 'Enter a backend URL first.'; return; }
+    try { localStorage.setItem(WORKER_KEY, v); } catch {}
+    if (el) el.textContent = 'Testing…';
+    try {
+      const r = await fetch(v + '/health', { headers: { accept: 'application/json' } });
+      const j = await r.json().catch(() => ({}));
+      amBackendUp = !!j.audiomack;
+      if (el) el.textContent = r.ok
+        ? `Reachable. Musi: ${j.musi ? 'yes' : 'no'} · Audiomack: ${j.audiomack ? 'yes' : 'no credentials'}`
+        : 'Backend replied ' + r.status;
+      render();
+    } catch (e) {
+      amBackendUp = false;
+      if (el) el.textContent = 'Could not reach that backend.';
+    }
+  }
+
+  async function startMusiImport() {
+    const raw = (document.querySelector('#musi-url')?.value || '').trim();
+    const code = musiCode(raw);
+    if (!code) { musiStatus('That is not a Musi playlist link.', true); return; }
+    musiStatus('Fetching playlist…');
+    try {
+      const payload = await musiFetch(code);
+      runMusiParse(payload);
+    } catch (e) {
+      if (e.message === 'NO_BACKEND') {
+        openMusiPaste(code);
+        musiStatus('No backend configured — use the paste method.');
+      } else {
+        musiStatus('Could not fetch: ' + e.message, true);
+      }
+    }
+  }
+
+  async function runMusiParse(payload) {
+    let parsed;
+    try { parsed = musiParse(payload); }
+    catch (e) { musiStatus(e.message, true); toast(e.message, true); return; }
+    musiStatus(`Importing "${parsed.name}" — ${parsed.items.length} tracks…`);
+    toast(`Importing ${parsed.items.length} tracks from "${parsed.name}"…`);
+    const res = await musiImport(parsed);
+    const s = res.stats;
+    musiStatus(`"${parsed.name}": ${s.added} new, ${s.already} already there · ${s.confirmed} confirmed, ${s.likely} likely, ${s.review} to review, ${s.unmatched} unmatched.`);
+    view = { kind: 'playlist', id: res.playlistId }; tab = 'playlists'; keepScroll = false;
+    render();
+  }
+
+  // Manual route used when no backend is configured. The user fetches the
+  // public JSON themselves and pastes it — no third-party proxy involved.
+  function openMusiPaste(code) {
+    const c = code || musiCode((document.querySelector('#musi-url')?.value || '')) || '';
+    const api = c ? MUSI_API(c) : '';
+    sheet(`<div class="sheet-title">Import without a backend</div>
+      <p class="sheet-copy">Musi's servers don't allow a browser on another site to read them, so either set up the Tempo backend, or do it by hand — it takes about 20 seconds:</p>
+      <ol class="steps">
+        <li>Open this link in a new tab:<br>${api ? `<a class="linkout" href="${esc(api)}" target="_blank" rel="noreferrer">${esc(api.slice(0, 60))}…</a>` : '<i>enter a playlist link first</i>'}</li>
+        <li>Select all of the text on that page and copy it</li>
+        <li>Paste it below</li>
+      </ol>
+      <textarea id="musi-json" class="settings-input" rows="5" placeholder='{"success":{...}}'></textarea>
+      <button class="primary-sheet" data-action="musi-paste-go">Import pasted playlist</button>
       <button data-action="close-sheet">Cancel</button>`);
   }
 
@@ -1892,6 +2540,11 @@
     idb, idbGetBlob, idbKeys, idbTotalBytes, idbClear,
     importLocalFiles, deleteLocalTrack, clearLocalLibrary, localTracks,
     searchLocal, fromFileName, readTags, canPlayFile, reconcileLocalLibrary,
+    // musi migration surface, for the automated QA pass
+    musiCode, musiParse, musiImport, musiNormalizeTitle, musiNormalizeArtist,
+    featuredArtists, versionTags, scoreCandidate, confidenceFor, matchTrack,
+    matchProviders, reviewQueue, adoptCandidate, revertToYouTube, MATCH,
+    fromAudiomack, playableAudiomack, workerBase,
     get localUrls() { return localUrls; },
     render
   };

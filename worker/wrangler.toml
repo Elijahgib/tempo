@@ -1,0 +1,8 @@
+name = "tempo-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# No KV, no D1, no Durable Objects, no R2 — this Worker holds no state.
+# Secrets are set with `wrangler secret put`, never committed:
+#   wrangler secret put AUDIOMACK_KEY
+#   wrangler secret put AUDIOMACK_SECRET
